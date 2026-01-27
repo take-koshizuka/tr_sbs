@@ -1,0 +1,124 @@
+# @package _global_
+name: tr_asbs
+fabric:
+  loggers:
+    tags: [gmm]
+
+seed: 0
+
+################################################################################
+# Potentials
+################################################################################
+potential:
+  _target_: tr_asbs.potential.gmm.GMM
+  dim: 50
+  num_components: 10
+  loc_scaling: 7 # 3
+  scale_scaling: 1
+  max_weight_ratio: 3.0
+  uniform_mixing_weights: false
+  softplus: true
+
+################################################################################
+# Settings for Gamma
+################################################################################
+gamma: 1.0
+gamma_schedule: trust_region
+trust_region_bound: 0.3
+iw_clip_value: 10
+
+################################################################################
+# Training settings
+################################################################################
+max_outer_loops: 80
+adjoint_matching_epochs: 150
+corrector_matching_epochs: 50
+steps_per_epoch: 100
+train_batch_size: 1000
+inference_batch_size: 10000
+num_samples_for_dual_loss: [5000, 40]
+
+################################################################################
+# Logging
+################################################################################
+log_detail_interval_epoch: 200
+monitor_values: [ "loss/tvd_soft", "loss/neg_avg_energy"]
+
+################################################################################
+# Models
+################################################################################
+controller:
+  _target_: tr_asbs.model.mlp.FourierMLP
+  dim: ${potential.dim}
+  num_layers: 4
+  channels: 256
+  clip_norm: 100.0
+
+corrector:
+  _target_: tr_asbs.model.mlp.FourierMLP
+  dim: ${potential.dim}
+  num_layers: 4
+  channels: 256
+  clip_norm: 100.0
+
+################################################################################
+# Optimization
+################################################################################
+controller_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+corrector_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+gradient_clip_val: 100.0
+
+################################################################################
+# Buffers
+################################################################################
+adjoint_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+corrector_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+initial_buffer_samples: 10000
+buffer_samples_per_epoch: 10000
+log_buffer_energy: true
+log_buffer_grad_norm: true
+
+################################################################################
+# Process and integration
+################################################################################
+source:
+  _target_: tr_asbs.process.source.GaussianPrior
+  dim: ${potential.dim}
+  scale: 5.0 # 2.5
+
+base_sde:
+  _target_: tr_asbs.process.sde.VESDE
+  sigma_min: 0.1
+  sigma_max: 2.0
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 200
+    rescale_t: null
+
+################################################################################
+# Terminal cost
+################################################################################
+terminal_cost:
+  _target_: tr_asbs.process.terminal_cost.ASBSTerminalCost
+  grad_clip_val: 100.0
+
+corrector_matching_mode: full

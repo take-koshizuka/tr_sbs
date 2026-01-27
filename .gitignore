@@ -1,0 +1,39 @@
+cat << 'EOF' > .gitignore
+# ===== Logs =====
+slurm-*.out
+
+# ===== Shell scripts (exclude) =====
+*.sh
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== Environments / cache =====
+.venv/
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.cache/
+
+# ===== Data & models =====
+data/
+*.pt
+*.model
+*.ckpt
+*.pth
+*.npz
+
+# ===== macOS garbage =====
+.DS_Store
+__MACOSX/
+._*
+
+# ===== HuggingFace / Hydra =====
+.hydra/
+checkpoints/
+
+# ===== Misc =====
+None
+EOF

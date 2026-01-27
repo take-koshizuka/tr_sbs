@@ -1,0 +1,56 @@
+# @package _global_
+defaults:
+  - _self_
+  - experiment: ala2
+
+root: /scratch/htc/tkoshizuka/tr_asbs
+seed: 0
+
+hydra:
+  run:
+    dir: ${root}/${name}
+
+curriculum: null
+
+log_loss_interval_step: 50
+log_detail_interval_epoch: 20
+checkpoint_directory: ${hydra:run.dir}/checkpoints/
+save_checkpoint_interval_epoch: 10000
+pretrained_controller_checkpoint: null
+
+eval_samples: 2000
+eval_samples_final: 4000
+save_samples: false
+sample_directory: ${hydra:run.dir}/samples
+save_sample_interval_epoch: 20
+
+progress_bar: true
+num_workers: 0
+compile: false  # ffor direct prediction
+resume: false
+ema_decay: null
+ema_start_step: 0
+visualize: false
+
+fabric:
+  _target_: lightning.fabric.Fabric
+  accelerator: cpu
+  strategy: auto
+  devices: 1
+  num_nodes: 1
+  loggers:
+    _target_: wandb.integration.lightning.fabric.WandbLogger
+    name: ${name}
+    entity: ml-takeshi-work
+    project: tr_asbs
+    #entity: ais2t_guests
+    #project: measure_transport
+    tags: null
+    save_dir: ${hydra:run.dir}
+    group: null
+  
+#wandb_host: https://wandb.zib.de/
+#wandb_key: local-b695da14758c0a61e42c00468ef41501ade574b4
+wandb_host: https://api.wandb.ai
+wandb_key: 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
+wandb_mode: online

@@ -32,7 +32,7 @@ max_outer_loops: 25
 adjoint_matching_epochs: 200
 corrector_matching_epochs: 50
 steps_per_epoch: 100
-train_batch_size: 500
+train_batch_size: 150
 inference_batch_size: 1000
 num_samples_for_dual_loss: [250, 20]
 

@@ -178,10 +178,9 @@ class CosineAnnealingWithWarmupScheduler(SequentialLR):
             milestones=[warmup_steps],
         )
 
-
-def copy_model(model):
-    frozen_model = copy.deepcopy(model)
-    for param in frozen_model.parameters():
+def copy_model(base_model, copied_model):
+    base_model.load_state_dict(copied_model.state_dict(), strict=True)
+    for param in base_model.parameters():
         param.requires_grad = False
-    frozen_model.eval()
-    return frozen_model
+    base_model.eval()
+    return base_model

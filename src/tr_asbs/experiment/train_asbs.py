@@ -22,6 +22,7 @@ import json
 import hashlib
 from omegaconf import OmegaConf
 import uuid
+from copy import deepcopy
 
 from tr_asbs.potential.base_potential import SumPotential
 from tr_asbs.potential.metadynamics import WellTemperedMetadynamicsBias
@@ -106,7 +107,8 @@ class ASBSModule:
             self.terminal_cost = hydra.utils.instantiate(
                 cfg.terminal_cost, potential=self.potential, corrector=self.corrector
             )
-            self.prev_integrator = copy_model(self.integrator)
+            
+            self.prev_integrator = deepcopy(self.integrator)
 
         self.max_outer_loops = cfg.max_outer_loops
         curriculum = []
@@ -214,7 +216,7 @@ class ASBSModule:
             current_task = self.curriculum[self.current_epoch]
             
             if current_task != prev_task and current_task == "adjoint_matching":
-                self.prev_integrator = copy_model(self.integrator)
+                self.prev_integrator = copy_model(self.prev_integrator, self.integrator)
                 
             self.populate_buffer(current_task)
             dataloader = self.create_dataloader(current_task)

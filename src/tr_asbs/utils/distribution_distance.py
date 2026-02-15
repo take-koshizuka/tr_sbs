@@ -1,3 +1,7 @@
+import os
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
+
 import math
 from functools import partial
 from typing import Dict, Optional, Union
@@ -7,6 +11,8 @@ import torch
 from torch.utils.dlpack import to_dlpack
 
 import ot as pot
+
+
 from scipy.optimize import linear_sum_assignment
 
 from tqdm import tqdm
@@ -34,7 +40,7 @@ def compute_distribution_distances(
     # Wasserstein distances
     metrics["W_1"] = compute_wasserstein1_exact(pred, true)
     metrics["W_2"] = compute_wasserstein2_exact(pred, true)
-    metrics["SD"] = compute_sinkhorn_divergence_jax(pred, true, epsilon=1e-3)
+    metrics["SD"] = sinkhorn_divergence_pytorch(pred.to('cuda'), true.to('cuda'), epsilon=1e-3).divergence.item()
     metrics["Sliced_W_1"] = sliced_wasserstein(pred, true, p=1, n_projections=100)
     metrics["Sliced_W_2"] = sliced_wasserstein(pred, true, p=2, n_projections=100)
     
@@ -464,52 +470,140 @@ def compute_wasserstein2_exact(
     cost_sq = pot.emd2(a, b, M, numItermax=num_iter_max)
     return float(math.sqrt(cost_sq))
 
-#################################################################################
-# Sinkhorn Divergence with JAX OTT
-#################################################################################
-import os
-os.environ["JAX_PLATFORMS"] = "cpu"
+import torch
 
-import jax
-import jax.numpy as jnp
-from ott.geometry import pointcloud
-from ott.tools import sinkhorn_divergence
+# ==========================================
+# 1. Output Class
+# ==========================================
+class SinkhornOutput:
+    def __init__(self, divergence: torch.Tensor, potentials: tuple):
+        self.divergence = divergence
+        self.potentials = potentials # ((f_xy, g_xy), (f_xx, g_xx), (f_yy, g_yy))
 
-def torch_to_jax(x: torch.Tensor):
-    x_cpu = x.detach().contiguous().cpu()
-    try:
-        return jax.dlpack.from_dlpack(to_dlpack(x_cpu))
-    except TypeError:
-        return jnp.asarray(x_cpu.numpy())
+    def __repr__(self):
+        return f"SinkhornOutput(divergence={self.divergence.item():.6f})"
 
-def _get_divergence(out):
-    if hasattr(out, "divergence"):
-        return out.divergence
-    if isinstance(out, tuple):
-        return out[0]
-    return out
-
-def compute_sinkhorn_divergence_jax(
-    x0: torch.Tensor,
-    x1: torch.Tensor,
-    epsilon: float = 1e-3,
-) -> float:
+# ==========================================
+# 2. Core Solver (JIT Compiled & Optimized)
+# ==========================================
+@torch.jit.script
+def _sinkhorn_fixed_schedule(
+    log_a: torch.Tensor, 
+    log_b: torch.Tensor, 
+    C: torch.Tensor, 
+    eps_target: float, 
+    scaling_steps: int, 
+    inner_iters: int, 
+    final_iters: int
+) -> torch.Tensor:
     """
-    Sinkhorn divergence using JAX OTT library.
-    Returns a float (the divergence).
+    Pythonオーバーヘッドを排除したJITコンパイル済みSinkhornソルバー
+    """
+    # 変数初期化
+    f = torch.zeros_like(log_a)
+    g = torch.zeros_like(log_b)
+    
+    # Epsilon Scaling Schedule
+    start_eps = 1.0
+    if start_eps < eps_target:
+         start_eps = eps_target * 10.0
+    
+    decay = (eps_target / start_eps) ** (1.0 / scaling_steps)
+    current_eps = start_eps
 
+    # Phase 1: Annealing
+    for _ in range(scaling_steps):
+        eps_val = torch.tensor(current_eps, device=log_a.device, dtype=log_a.dtype)
+        eps_ = eps_val.view(1, 1, 1)
+        
+        for __ in range(inner_iters):
+            tmp_f = (g.unsqueeze(1) - C) / eps_
+            f = eps_.view(-1, 1) * (log_a - torch.logsumexp(tmp_f, dim=2))
+            
+            tmp_g = (f.unsqueeze(2) - C) / eps_
+            g = eps_.view(-1, 1) * (log_b - torch.logsumexp(tmp_g, dim=1))
+        
+        current_eps *= decay
+
+    # Phase 2: Final Convergence
+    eps_final = torch.tensor(eps_target, device=log_a.device, dtype=log_a.dtype).view(1, 1, 1)
+    
+    for _ in range(final_iters):
+        tmp_f = (g.unsqueeze(1) - C) / eps_final
+        f = eps_final.view(-1, 1) * (log_a - torch.logsumexp(tmp_f, dim=2))
+        
+        tmp_g = (f.unsqueeze(2) - C) / eps_final
+        g = eps_final.view(-1, 1) * (log_b - torch.logsumexp(tmp_g, dim=1))
+        
+    return torch.stack((f, g), dim=0)
+
+# ==========================================
+# 3. Main Interface
+# ==========================================
+def sinkhorn_divergence_pytorch(
+    pred: torch.Tensor, 
+    true: torch.Tensor, 
+    epsilon: float = 1e-3
+) -> SinkhornOutput:
+    """
+    Calculates Sinkhorn Divergence between two point clouds.
+    
     Args:
-        x0, x1: Sample tensors of shape (n_samples, n_features) or flattened if higher.
-        epsilon: Regularization parameter.
-
+        pred: (N, D) tensor
+        true: (M, D) tensor (Optimized for N=M)
+        epsilon: Regularization parameter
+        
     Returns:
-        float: Sinkhorn divergence.
+        SinkhornOutput object with .divergence property
     """
-    # Convert to JAX
-    x0_jax = torch_to_jax(x0)
-    x1_jax = torch_to_jax(x1)
+    # 精度チェック (epsilonが小さい時はdouble推奨)
+    if pred.dtype != torch.float64 and epsilon < 1e-2:
+         # 必要に応じて pred = pred.double(), true = true.double() をここで行う
+         pass
 
-    geom = pointcloud.PointCloud(x0_jax, x1_jax, epsilon=epsilon)
-    out = sinkhorn_divergence.sinkhorn_divergence(geom, x=geom.x, y=geom.y)
-    sd = _get_divergence(out)
-    return float(sd)
+    N, D = pred.shape
+    device = pred.device
+    dtype = pred.dtype
+
+    # --- Batch Processing (XY, XX, YY) ---
+    # (3, N, D)
+    x_stack = torch.stack([pred, pred, true], dim=0)
+    y_stack = torch.stack([true, pred, true], dim=0)
+    
+    # Cost Matrix: ||x-y||^2
+    dots = torch.bmm(x_stack, y_stack.transpose(1, 2))
+    x_norm = (x_stack**2).sum(dim=2).unsqueeze(2)
+    y_norm = (y_stack**2).sum(dim=2).unsqueeze(1)
+    C = torch.clamp(x_norm + y_norm - 2 * dots, min=0.0)
+
+    # Weights (Uniform)
+    log_n = -torch.log(torch.tensor(N, dtype=dtype, device=device))
+    log_a = torch.full((3, N), log_n, dtype=dtype, device=device)
+    log_b = torch.full((3, N), log_n, dtype=dtype, device=device)
+
+    # --- Solving ---
+    # パラメータ: eps=1e-3向け固定設定
+    scaling_steps = 15
+    inner_iters = 20
+    final_iters = 100
+    
+    fg = _sinkhorn_fixed_schedule(
+        log_a, log_b, C, 
+        eps_target=float(epsilon), 
+        scaling_steps=scaling_steps, 
+        inner_iters=inner_iters, 
+        final_iters=final_iters
+    )
+    f, g = fg[0], fg[1]
+
+    # --- Divergence Calculation ---
+    real_w = torch.exp(log_a)
+    ot_costs = torch.sum((f + g) * real_w, dim=1)
+    
+    # div = OT_xy - 0.5 * (OT_xx + OT_yy)
+    div_value = ot_costs[0] - 0.5 * (ot_costs[1] + ot_costs[2])
+    
+    return SinkhornOutput(
+        divergence=div_value,
+        potentials=((f[0], g[0]), (f[1], g[1]), (f[2], g[2]))
+    )

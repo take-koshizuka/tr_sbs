@@ -162,7 +162,7 @@ class GammaASBSModule:
     
     def inner_loop_u(self):
         current_task = "adjoint_matching"
-        self.prev_integrator = copy_model(self.integrator)
+        self.prev_integrator = copy_model(self.prev_integrator, self.integrator)
         for j in range(self.cfg.adjoint_matching_epochs):
             self.populate_buffer_adjoint_matching()
             dataloader = self.create_dataloader(current_task)

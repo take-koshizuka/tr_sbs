@@ -34,6 +34,7 @@ from tr_asbs.utils.eval_logweight import compute_reverse_ess, normalize_log_weig
 from tr_asbs.utils.helper import Checkpointer, CheckpointConfig
 
 import time
+import torch._dynamo
 
 def stable_group_id(cfg: dict, exclude=("seed", "name")):
     if not isinstance(cfg, dict):
@@ -64,6 +65,7 @@ class GammaASBSModule:
     
         # step size
         self.gamma = cfg.gamma
+        self.V0 = 1e-9
         assert 0 <= self.gamma <= 1
         self.gamma_schedule = cfg.gamma_schedule
         assert self.gamma_schedule in ["fixed", "trust_region"]
@@ -165,7 +167,7 @@ class GammaASBSModule:
     
     def inner_loop_u(self):
         current_task = "adjoint_matching"
-        self.prev_integrator = copy_model(self.integrator)
+        self.prev_integrator = copy_model(self.prev_integrator, self.integrator)
         for j in range(self.cfg.adjoint_matching_epochs):
             self.populate_buffer_adjoint_matching()
             dataloader = self.create_dataloader(current_task)
@@ -192,6 +194,8 @@ class GammaASBSModule:
                         tag_best=f"{name_safe}_best",          # ファイル名 "{tag}.pt" なので "best.pt" になる
                         extra_status={"eval_step": metrics["eval_step"]},
                     )
+                del metrics
+                torch.cuda.empty_cache()
             
     def inner_loop_h(self):
         current_task = "corrector_matching"
@@ -220,6 +224,8 @@ class GammaASBSModule:
                         tag_best=f"{name_safe}_best",          # ファイル名 "{tag}.pt" なので "best.pt" になる
                         extra_status={"eval_step": metrics["eval_step"]},
                     )
+                del metrics
+                torch.cuda.empty_cache()
     ############################################################################
     # Training loop structure
     ############################################################################
@@ -236,7 +242,7 @@ class GammaASBSModule:
             
         if self.cfg.resume:
             self.load_checkpoint()
-        
+            
         metrics = self.log_details(0)
         for name in self.cfg.monitor_values:
             name_safe = name.replace("/", "_")
@@ -249,14 +255,8 @@ class GammaASBSModule:
 
         for outer_step in range(self.max_outer_loops):
             if self.gamma_schedule == "trust_region":
-                print("Optimizing gamma via trust region...")
-                self.gamma = self.optimize_gamma()
-                print(self.gamma)
-            
-            print("Starting inner loop for controller u...")
+                self.gamma, self.V0 = self.optimize_gamma()
             self.inner_loop_u()
-            
-            print("Starting inner loop for corrector h...")
             self.inner_loop_h()
 
         self.save_checkpoint()
@@ -306,11 +306,14 @@ class GammaASBSModule:
                 return_trajectory=False,
                 progress_bar=(self.fabric.global_rank == 0) and self.cfg.progress_bar,
             )
+            
+            # filter 
+            r = min(-(self.V0 / integral_results['log_Ph_Pref'].mean().item()), 1.0)   
             populate_data = {
-                "data_0": data_0, 
-                "data_1": integral_results['data_1'],
-                "log_Ph_Pref": integral_results['log_Ph_Pref'],
-                "log_Pu_Pref": integral_results['log_Pu_Pref'],
+                "data_0": data_0.detach().cpu(), 
+                "data_1": integral_results['data_1'].detach().cpu(),
+                "log_Ph_Pref": (r * integral_results['log_Ph_Pref']).detach().cpu(), # dP^h/dP^u
+                "log_Pu_Pref": integral_results['log_Pu_Pref'].detach().cpu(),
             }
             
             if "log_Pref_Pu_det" in integral_results:
@@ -323,14 +326,14 @@ class GammaASBSModule:
                 return_grad_norm=self.cfg.log_buffer_grad_norm,
             )
             
-            populate_data["terminal_cost"] = terminal_cost_results["terminal_cost"]
+            populate_data["terminal_cost"] = terminal_cost_results["terminal_cost"].detach().cpu()
             time_1 = self.fabric.to_device(torch.ones(self.cfg.inference_batch_size, dtype=torch.float))
-            populate_data["control_1"] = self.prev_integrator.sde.u_controller(time_1, integral_results['data_1']).detach()
+            populate_data["control_1"] = self.prev_integrator.sde.u_controller(time_1, integral_results['data_1']).detach().cpu()
             
             if self.cfg.log_buffer_energy:
-                populate_data["energy"] = terminal_cost_results["energy"]
+                populate_data["energy"] = terminal_cost_results["energy"].detach().cpu()
             if self.cfg.log_buffer_grad_norm:
-                populate_data["grad_norm"] = terminal_cost_results["grad_norm"]
+                populate_data["grad_norm"] = terminal_cost_results["grad_norm"].detach().cpu()
 
             buffer.extend(**populate_data)
 
@@ -411,8 +414,8 @@ class GammaASBSModule:
                 progress_bar=(self.fabric.global_rank == 0) and self.cfg.progress_bar,
             )
             populate_data = {
-                "data_0": data_0,
-                "data_1": data_1,
+                "data_0": data_0.detach().cpu(),
+                "data_1": data_1.detach().cpu(),
             }
             buffer.extend(**populate_data)
         
@@ -443,7 +446,8 @@ class GammaASBSModule:
             )
             log_Pu_Ph = -integral_results["log_Ph_Pref"].reshape(self.cfg.inference_batch_size//batch_size_path, batch_size_path)
             # the expectation wrt paths using self.batch_size_path samples
-            buffer.extend(**{"log_weights": log_Pu_Ph})
+            # dP^u/dP^h
+            buffer.extend(**{"log_weights": log_Pu_Ph.detach().cpu()})
         
         self.integrator.train()
 
@@ -726,7 +730,9 @@ class GammaASBSModule:
             "current_epoch": self.current_epoch,
         }
         self.fabric.save(checkpoint_path, state)
-        
+    
+    @torch.no_grad()
+    @torch._dynamo.disable()  
     def log_details(self, step: int, visualize: bool = False, eval_samples:int = None) -> dict:
         visualize = visualize or self.cfg.visualize
         eval_samples = eval_samples if eval_samples is not None else self.cfg.eval_samples
@@ -743,38 +749,38 @@ class GammaASBSModule:
             progress_bar=(self.fabric.global_rank == 0) and self.cfg.progress_bar,
         )
         results = {
-            "data_0": data_0[:self.cfg.eval_samples],
-            "data_1": integral_results['data_1'][:self.cfg.eval_samples],
-            "log_Ph_Pref": integral_results['log_Ph_Pref'][:self.cfg.eval_samples],
-            "log_Pu_Pref": integral_results['log_Pu_Pref'][:self.cfg.eval_samples],
-            'log_RN[u_next|u]_eff': integral_results['log_Pref_Pu_det'][:self.cfg.eval_samples],
-            'log_RN[u_next|u]': -integral_results['log_Pu_Pref'][:self.cfg.eval_samples],
+            "data_0": data_0[:self.cfg.eval_samples].detach().cpu(),
+            "data_1": integral_results['data_1'][:self.cfg.eval_samples].detach().cpu(),
+            "log_Ph_Pref": integral_results['log_Ph_Pref'][:self.cfg.eval_samples].detach().cpu(),
+            "log_Pu_Pref": integral_results['log_Pu_Pref'][:self.cfg.eval_samples].detach().cpu(),
+            'log_RN[u_next|u]_eff': integral_results['log_Pref_Pu_det'][:self.cfg.eval_samples].detach().cpu(),
+            'log_RN[u_next|u]': -integral_results['log_Pu_Pref'][:self.cfg.eval_samples].detach().cpu(),
             'predict_drift_fn': self.sde.drift,
         }
         
         if self.current_epoch > 0:
-            dataloader = DataLoader(
-                self.adjoint_buffer,
-                batch_size=self.cfg.train_batch_size,
-                collate_fn=self.adjoint_buffer.collate_fn,
-                num_workers=self.cfg.num_workers,
-                pin_memory=False,
-                persistent_workers=False,
-            )
-            
-            all_log_weights = []
-            all_log_weights_smooth = []
-            for batch in dataloader:
-                log_weights = batch["log_Ph_Pref"]
-                log_weights_smooth = self.gamma * batch["log_Ph_Pref"] + (1 - self.gamma) * batch["log_Pu_Pref"]
-                all_log_weights.append(log_weights)
-                all_log_weights_smooth.append(log_weights_smooth)
-            # dim=0 で concatenate
-            results['log_RN[h|u]'] = torch.cat(all_log_weights, dim=0)
-            results['log_RN[u_next|u]_pred_buffer'] = torch.cat(all_log_weights_smooth, dim=0)
-            results['lm'] = self.lm
-            results['gamma'] = self.gamma
-        
+            # バッファが空でないか確認
+            if len(self.adjoint_buffer) > 0:
+                # BatchBuffer.storage から直接参照 (CPU上のTensor)
+                # コピーは発生せず、参照だけなので爆速かつメモリ消費ゼロ
+                log_Ph_Pref = torch.stack(self.adjoint_buffer.storage["log_Ph_Pref"])
+                log_Pu_Pref = torch.stack(self.adjoint_buffer.storage["log_Pu_Pref"])
+                
+                # ベクトル化された演算で一気に計算 (Pythonループなし)
+                # log_RN[h|u] は参照渡しで済ませる
+                results['log_RN[h|u]'] = log_Ph_Pref
+                
+                # 線形結合の計算 (CPU上で実行)
+                # ここだけ新しいメモリを確保しますが、リストを作るより遥かにマシです
+                results['log_RN[u_next|u]_pred_buffer'] = (
+                    self.gamma * log_Ph_Pref + (1 - self.gamma) * log_Pu_Pref
+                )
+                
+                results['lm'] = self.lm
+                results['gamma'] = self.gamma
+            else:
+                # バッファが空の場合のハンドリング（必要なら）
+                pass
         if self.current_epoch == 0:
             logs = self.potential.log_details(results, visualize=visualize)
             if visualize:
@@ -796,7 +802,9 @@ class GammaASBSModule:
 
         self.fabric.log_dict(logs, step=self.global_step)
         
-        logs.update({"data_0": data_0, "data_1": integral_results['data_1']})
+        logs.update({"data_0": data_0.detach().cpu(), "data_1": integral_results['data_1'].detach().cpu()})
+        
+        del results, integral_results
         return logs
     
     def log_final(self):
@@ -849,35 +857,104 @@ class GammaASBSModule:
              
         wandb.finish()
         
+    # 既存の populate_buffer_log_weights を置き換えるか、あるいは
+    # optimize_gamma 専用のこの関数を追加してください。
     @torch.no_grad()
-    def dual_loss(self, lm, dataloader):
+    @torch._dynamo.disable()
+    def collect_log_weights_for_optimization(self):
+        """
+        Gamma最適化のために log weights を収集し、単一の巨大なNumPy配列として返します。
+        BatchBufferやDataLoaderを経由せず、メモリオーバーヘッドを最小化します。
+        """
+        self.integrator.eval()
+        
+        # 設定の読み出し
+        total_samples = self.cfg.num_samples_for_dual_loss[0]
         batch_size_path = self.cfg.num_samples_for_dual_loss[1]
-        mean_log_weights_sum = torch.zeros((min(self.cfg.inference_batch_size, self.cfg.num_samples_for_dual_loss[0]), ))
-        for j, batch in enumerate(dataloader):
-            # the expectation wrt paths using self.batch_size_path samples
-            mean_log_weights = torch.logsumexp((- 1 / (1 + lm)) * batch["log_weights"], dim=1) - math.log(batch_size_path)
-            mean_log_weights_sum += mean_log_weights
-        # the expectation wrt x_0 using self.batch_size samples
-        V = (1 + lm) * (-mean_log_weights_sum / (j+1)).mean(0)
-        return V.item()
+        inference_batch_size = self.cfg.inference_batch_size
+        
+        paths_per_batch = inference_batch_size // batch_size_path
+        num_iters = total_samples // paths_per_batch
+        
+        all_log_weights_np = []
+
+        # プログレスバー（必要に応じて）
+        iterator = range(num_iters)
+        if self.fabric.global_rank == 0 and self.cfg.progress_bar:
+             iterator = tqdm(iterator, desc="Collecting weights", leave=False)
+
+        for _ in iterator:
+            # 念のためループごとにメモリ掃除
+            torch.cuda.empty_cache()
+            # データの準備
+            data_0 = self.source.replicate_sample((paths_per_batch,), batch_size_path)
+            
+            # 積分実行
+            integral_results = self.integrator.run_with_logweights(
+                integrator=self.integrator,
+                prior_log_prob_fn=self.source.log_prob,
+                target_log_prob_fn=self.potential.log_prob,
+                initial_data=data_0,
+                center_every_step=self.potential.is_mean_free,
+                zero_last_step_noise=False,
+                return_trajectory=False,
+                progress_bar=False,
+            )
+            
+            # Log weights 計算: dP^u/dP^h
+            # shape: (paths_per_batch * batch_size_path, ) -> (paths_per_batch, batch_size_path)
+            log_Pu_Ph = -integral_results["log_Ph_Pref"].reshape(paths_per_batch, batch_size_path)
+            
+            # 【重要】ここで即座に CPU NumPy 配列に変換してリストに追加
+            # これにより GPU メモリと PyTorch の計算グラフ用メモリを即解放
+            all_log_weights_np.append(log_Pu_Ph.detach().cpu().numpy().astype(np.float64))
+            
+            # 明示的にキャッシュクリア（念のため）
+            del integral_results, log_Pu_Ph, data_0
+        
+        self.integrator.train()
+        
+        # 最後に結合 (100万サンプル程度なら数MB〜数十MBなので全く問題なし)
+        if len(all_log_weights_np) > 0:
+            return np.concatenate(all_log_weights_np, axis=0)
+        else:
+            return np.array([])
 
     def optimize_gamma(self, max_lm=1e6) -> float:
-        log_weights_buffer = BatchBuffer(max_size=self.cfg.num_samples_for_dual_loss[0])
-        self.populate_buffer_log_weights(log_weights_buffer)
-        dataloader = DataLoader(
-            log_weights_buffer,
-            batch_size=min(self.cfg.inference_batch_size, self.cfg.num_samples_for_dual_loss[0]),
-            collate_fn=log_weights_buffer.collate_fn,
-            num_workers=self.cfg.num_workers,
-            pin_memory=False,
-            persistent_workers=False,
-        )
-        neg_dual = lambda lm: -self.dual_loss(lm, dataloader) + lm * self.trust_region_bound
-        res = minimize_scalar(neg_dual, bounds=(0, max_lm), method="Bounded")
-        best_lambda: float = res.x
-        best_gamma = 1 / (1 + best_lambda)
-        del log_weights_buffer
-        return best_gamma
+        # 1. データを収集 (NumPy配列)
+        log_weights_np = self.collect_log_weights_for_optimization()
+        
+        if log_weights_np.size == 0:
+            rank_zero_warn("No samples collected for gamma optimization. Skipping.")
+            return self.gamma, 0.0
+
+        batch_size_path = self.cfg.num_samples_for_dual_loss[1]
+        
+        # scipy.special.logsumexp を使用
+        from scipy.special import logsumexp
+
+        # 2. 高速計算用ローカル関数 (純粋な NumPy 計算)
+        def calc_V(lm):
+            alpha = -1.0 / (1.0 + lm)
+            # axis=1 でパスごとの和を取る
+            term = logsumexp(alpha * log_weights_np, axis=1) - math.log(batch_size_path)
+            V = (1.0 + lm) * (-np.mean(term))
+            return V
+
+        # 3. 最適化対象の関数
+        def objective(lm):
+             V = calc_V(lm)
+             return -V + lm * self.trust_region_bound
+
+        # 4. 最適化実行 (scipy)
+        # bounds 内でスカラー最適化
+        res = minimize_scalar(objective, bounds=(0, max_lm), method="Bounded")
+        best_lambda = res.x
+        best_gamma = 1.0 / (1.0 + best_lambda)
+        
+        val_0 = calc_V(0.0)
+            
+        return best_gamma, val_0
 
 @hydra.main(version_base=None, config_path="../config", config_name="train")
 def main(cfg: DictConfig) -> None:
@@ -885,7 +962,6 @@ def main(cfg: DictConfig) -> None:
     os.environ["WANDB_BASE_URL"] = str(cfg.wandb_host)      # 例: "https://wandb.zib.de"
     os.environ["WANDB_API_KEY"] = str(cfg.wandb_key)
     os.environ["WANDB_API_KEY"] = str(cfg.wandb_key)
-
     # (任意) 対話ログインは不要。入れるなら host 引数なしでOK
     wandb.login(key=os.environ["WANDB_API_KEY"], relogin=True)
     torch.set_float32_matmul_precision("high")

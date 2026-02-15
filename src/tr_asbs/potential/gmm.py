@@ -212,7 +212,7 @@ class GMM(BaseEnergy):
 
     @torch.no_grad()
     def visualize(self, samples: torch.Tensor, title=None) -> dict:
-        plt.close()
+        plt.close("all")
         fig = plt.figure()
         ax = fig.add_subplot()
 
@@ -247,7 +247,6 @@ class GMM(BaseEnergy):
     def log_details(self, results: dict, prefix: str="", visualize=True) -> dict:
         # まずスーパークラスのログ関数を呼ぶ
         logs = super().log_details(results, prefix=prefix, visualize=visualize)
-
         # サンプルを用意して経験的分布を得る
         # samples = self.sample(sample_shape=(1000,))
         pred_samples = results["data_1"]

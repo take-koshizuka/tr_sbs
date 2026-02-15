@@ -13,7 +13,7 @@ potential:
   _target_: tr_asbs.potential.many_well_energy.ManyWellEnergy
   dim: 8
   m: 5
-  delta: 4.0
+  delta: 8.0
 
 ################################################################################
 # Settings for Gamma
@@ -98,7 +98,7 @@ source:
 base_sde:
   _target_: tr_asbs.process.sde.VESDE
   sigma_min: 0.01
-  sigma_max: 0.1
+  sigma_max: 0.2
   
 integrator:
   _target_: tr_asbs.process.integrator.ExponentialIntegrator

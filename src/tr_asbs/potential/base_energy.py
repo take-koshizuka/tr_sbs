@@ -87,13 +87,14 @@ class BaseEnergy:
     def sample(self, size: tuple | int) -> torch.Tensor:
         pass
     
+    @torch.no_grad()
     def sample_loss(self, samples: torch.Tensor) -> torch.Tensor:
         gt_samples = self.sample(samples.shape[0])
-        samples = samples.view(samples.shape[0], -1).detach()
-        gt_samples = gt_samples.view(gt_samples.shape[0], -1).detach()
+        samples = samples.view(samples.shape[0], -1).detach().cpu()
+        gt_samples = gt_samples.view(gt_samples.shape[0], -1).detach().cpu()
         res = compute_distribution_distances(samples, gt_samples.to(samples.device))
         return res
-
+    @torch.no_grad()
     def energy_dist_error(self, energies: torch.Tensor) -> torch.Tensor:
         gt_samples = self.sample(energies.shape[0])
         gt_samples = gt_samples.view(gt_samples.shape[0], -1).detach()
@@ -105,11 +106,10 @@ class BaseEnergy:
         data_1 = results["data_1"]
         loss_metrics = self.sample_loss(data_1)
         energy = -self.eval(data_1)
-        
         loss_metrics.update({'neg_avg_energy': -energy.mean().item()})
         loss_metrics.update(self.energy_dist_error(energy))
-    
         log = {f'{prefix}loss/{key}': loss_metrics[key] for key in loss_metrics }
+        del loss_metrics, energy
         
         for name, value in results.items():
             # log_RN で始まるログだけ処理

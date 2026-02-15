@@ -34,7 +34,7 @@ visualize: false
 
 fabric:
   _target_: lightning.fabric.Fabric
-  accelerator: cpu
+  accelerator: cuda
   strategy: auto
   devices: 1
   num_nodes: 1

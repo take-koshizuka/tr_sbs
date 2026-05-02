@@ -24,7 +24,6 @@ import hashlib
 from omegaconf import OmegaConf
 
 from tr_asbs.process.sde import ControlledSDE, ControlledFBSDE
-from tr_asbs.utils.topology import save_data_to_pdb
 from tr_asbs.utils.training import EMA, copy_model
 from tr_asbs.data.buffer import BatchBuffer
 from tr_asbs.utils.eval_logweight import compute_reverse_ess, normalize_log_weights
@@ -137,7 +136,9 @@ class GammaASBSModule:
     def __init__(self, cfg: DictConfig):
         super().__init__()
         self.cfg = cfg
-        cfg.fabric.loggers.group = stable_group_id(cfg)
+        logger_target = str(getattr(cfg.fabric.loggers, "_target_", "")).lower()
+        if "wandb" in logger_target and "group" in cfg.fabric.loggers:
+            cfg.fabric.loggers.group = stable_group_id(cfg)
         
         
         # step size
@@ -502,14 +503,7 @@ class GammaASBSModule:
             sample_directory = Path(self.cfg.sample_directory)
             if not sample_directory.exists():
                 sample_directory.mkdir(parents=True, exist_ok=True)
-            if hasattr(self.cfg, "topology_pdb_file"):  # Save as PDB instead
-                filename = sample_directory / f"epoch_{self.current_epoch:04d}.pdb"
-                save_data_to_pdb(
-                    data=data,
-                    topology_file=self.cfg.topology_pdb_file,
-                    output_file=str(filename),
-                )
-            elif isinstance(data, torch.Tensor):  # Save as XYZ if data is tensor
+            if isinstance(data, torch.Tensor):  # Save as XYZ if data is tensor
                 filename = sample_directory / f"epoch_{self.current_epoch:04d}.npy"
                 np.save(filename, data.cpu().numpy())
             else:  # default to XYZ format
@@ -874,7 +868,10 @@ class GammaASBSModule:
 @hydra.main(version_base=None, config_path="../config", config_name="train")
 def main(cfg: DictConfig) -> None:
     # NOTE: changing matmul precision may result in mean drift
-    wandb.login(host="https://wandb.zib.de/")
+    logger_target = str(getattr(cfg.fabric.loggers, "_target_", "")).lower()
+    use_wandb_logger = "wandb" in logger_target
+    if use_wandb_logger:
+        wandb.login(host="https://wandb.zib.de/")
     torch.set_float32_matmul_precision("high")
     trainer = GammaASBSModule(cfg)
     trainer.fit()

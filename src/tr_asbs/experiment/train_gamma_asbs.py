@@ -25,7 +25,6 @@ import uuid
 from omegaconf import OmegaConf
 
 from tr_asbs.process.sde import ControlledSDE, ControlledFBSDE
-from tr_asbs.utils.topology import save_data_to_pdb
 from tr_asbs.utils.training import EMA, copy_model
 from tr_asbs.data.buffer import BatchBuffer
 from tr_asbs.utils.eval_logweight import compute_reverse_ess, normalize_log_weights
@@ -54,7 +53,9 @@ class GammaASBSModule:
         self.cfg = cfg
         random_hash = uuid.uuid4().hex[:8]
         self.group_id = str(stable_group_id(cfg, exclude=("name"))) + f"{random_hash}"
-        cfg.fabric.loggers.group = stable_group_id(cfg)
+        logger_target = str(getattr(cfg.fabric.loggers, "_target_", "")).lower()
+        if "wandb" in logger_target and "group" in cfg.fabric.loggers:
+            cfg.fabric.loggers.group = stable_group_id(cfg)
         
         wandb_logger = hydra.utils.instantiate(cfg.fabric.loggers)
         full_cfg = OmegaConf.to_container(cfg, resolve=True)
@@ -449,14 +450,7 @@ class GammaASBSModule:
             sample_directory = Path(self.cfg.sample_directory)
             if not sample_directory.exists():
                 sample_directory.mkdir(parents=True, exist_ok=True)
-            if hasattr(self.cfg, "topology_pdb_file"):  # Save as PDB instead
-                filename = sample_directory / f"epoch_{self.current_epoch:04d}.pdb"
-                save_data_to_pdb(
-                    data=data,
-                    topology_file=self.cfg.topology_pdb_file,
-                    output_file=str(filename),
-                )
-            elif isinstance(data, torch.Tensor):  # Save as XYZ if data is tensor
+            if isinstance(data, torch.Tensor):  # Save as XYZ if data is tensor
                 filename = sample_directory / f"epoch_{self.current_epoch:04d}.npy"
                 np.save(filename, data.cpu().numpy())
             else:  # default to XYZ format
@@ -864,12 +858,12 @@ class GammaASBSModule:
 
 @hydra.main(version_base=None, config_path="../config", config_name="train")
 def main(cfg: DictConfig) -> None:
-    os.environ["WANDB_BASE_URL"] = str(cfg.wandb_host)      # 例: "https://wandb.zib.de"
-    os.environ["WANDB_API_KEY"] = str(cfg.wandb_key)
-    os.environ["WANDB_API_KEY"] = str(cfg.wandb_key)
-
-    # (任意) 対話ログインは不要。入れるなら host 引数なしでOK
-    wandb.login(key=os.environ["WANDB_API_KEY"], relogin=True)
+    logger_target = str(getattr(cfg.fabric.loggers, "_target_", "")).lower()
+    use_wandb_logger = "wandb" in logger_target
+    if use_wandb_logger:
+        os.environ["WANDB_BASE_URL"] = str(cfg.wandb_host)
+        os.environ["WANDB_API_KEY"] = str(cfg.wandb_key)
+        wandb.login(key=os.environ["WANDB_API_KEY"], relogin=True)
     torch.set_float32_matmul_precision("high")
     trainer = GammaASBSModule(cfg)
     trainer.fit()

@@ -9,11 +9,14 @@ from typing import Union, Tuple, Optional
 
 import torch
 import torch.nn as nn
-from fairchem.core.datasets.atomic_data import AtomicData
-from tr_asbs.utils.geometry import is_mean_free_data, subtract_mean_batch, subtract_com_vector
+from tr_asbs.utils.geometry import subtract_mean_batch, subtract_com_vector
 from mace.tools.torch_geometric import Batch
 
 DataType = Union[torch.Tensor, Batch]
+
+
+def _is_graph_data(data: DataType) -> bool:
+    return hasattr(data, "pos") and hasattr(data, "batch")
 
 class BaseSDE(nn.Module, ABC):
     """Base class for Forward SDEs: dX_t = f(t, X_t) dt + g(t) dW_t."""
@@ -34,7 +37,7 @@ class BaseSDE(nn.Module, ABC):
 
     def randn_like(self, data: DataType) -> torch.Tensor:
         """Generate random noise with the same shape as positions."""
-        if isinstance(data, AtomicData):
+        if _is_graph_data(data):
             noise = torch.randn_like(data.pos)
             if self.is_mean_free:
                 noise = subtract_mean_batch(noise, data.batch)
@@ -102,7 +105,7 @@ class ZeroDriftSDE(FwdBwdSDE, ABC):
         if time.dim() == 1:
             time = time.unsqueeze(-1)
 
-        if isinstance(data_0, AtomicData):
+        if _is_graph_data(data_0):
             data_0_pos, data_1_pos = data_0.pos, data_1.pos
             t_reparam = self.reparametrize_time(time[data_0.batch, None])
         else:
@@ -118,11 +121,9 @@ class ZeroDriftSDE(FwdBwdSDE, ABC):
         
         pos_t = mean + std * self.randn_like(data_0_pos)
 
-        if isinstance(data_0, AtomicData):
+        if _is_graph_data(data_0):
             data_t = data_0.clone()
             data_t.pos = pos_t
-            if not is_mean_free_data(data_t):
-                raise ValueError("Sampled data_t is not mean-free")
             return data_t
         else:
             pos_t = pos_t.reshape(data_size)
@@ -136,7 +137,7 @@ class ZeroDriftSDE(FwdBwdSDE, ABC):
         if time.dim() == 1:
             time = time.unsqueeze(-1)
             
-        if isinstance(data_0, AtomicData):
+        if _is_graph_data(data_0):
             data_size = data_0.pos.shape
             d0, dt = data_0.pos.reshape(data_size[0], -1), data_t.pos.reshape(data_size[0], -1)
             var = self.diffsquare_integral(time[data_0.batch, None])
@@ -156,7 +157,7 @@ class ZeroDriftSDE(FwdBwdSDE, ABC):
         if time.dim() == 1:
             time = time.unsqueeze(-1)
         
-        if isinstance(data_1, AtomicData):
+        if _is_graph_data(data_1):
             data_size = data_1.pos.shape
             d1, dt = data_1.pos.reshape(data_size[0], -1), data_t.pos.reshape(data_size[0], -1)
             var = self.total_variance - self.diffsquare_integral(time[data_1.batch, None])
@@ -171,11 +172,9 @@ class ZeroDriftSDE(FwdBwdSDE, ABC):
     def _validate_pair(self, d_a: DataType, d_b: DataType):
         if type(d_a) != type(d_b):
             raise ValueError("Data types must match.")
-        if isinstance(d_a, AtomicData):
+        if _is_graph_data(d_a):
             if (d_a.batch != d_b.batch).any():
                 raise ValueError("Batch indices must match.")
-            if not (is_mean_free_data(d_a) and is_mean_free_data(d_b)):
-                raise ValueError("Data must be mean-free.")
 
 
 class VESDE(ZeroDriftSDE):

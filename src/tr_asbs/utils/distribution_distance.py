@@ -40,7 +40,11 @@ def compute_distribution_distances(
     # Wasserstein distances
     metrics["W_1"] = compute_wasserstein1_exact(pred, true)
     metrics["W_2"] = compute_wasserstein2_exact(pred, true)
-    metrics["SD"] = sinkhorn_divergence_pytorch(pred.to('cuda'), true.to('cuda'), epsilon=1e-3).divergence.item()
+    # Keep Sinkhorn on the same device as inputs (works for CPU-only smoke runs).
+    sinkhorn_device = pred.device
+    metrics["SD"] = sinkhorn_divergence_pytorch(
+        pred.to(sinkhorn_device), true.to(sinkhorn_device), epsilon=1e-3
+    ).divergence.item()
     metrics["Sliced_W_1"] = sliced_wasserstein(pred, true, p=1, n_projections=100)
     metrics["Sliced_W_2"] = sliced_wasserstein(pred, true, p=2, n_projections=100)
     

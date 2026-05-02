@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import torch
-from fairchem.core.datasets.atomic_data import AtomicData
 
 
 def get_mean_batch(positions: torch.Tensor, batch_index: torch.Tensor) -> torch.Tensor:
@@ -65,20 +64,6 @@ def is_mean_free_batch(
     """
     means = get_mean_batch(positions, batch_index)
     return torch.allclose(means, torch.zeros_like(means), atol=atol)
-
-
-def is_mean_free_data(data: AtomicData, atol: float = 1e-5) -> bool:
-    """
-    Check if the positions in an AtomicData object are mean-free per graph.
-
-    Args:
-        data (AtomicData): AtomicData object containing positions and batch indices.
-        atol (float): Absolute tolerance for checking mean-free condition.
-
-    Returns:
-        bool: True if positions are mean-free, False otherwise.
-    """
-    return is_mean_free_batch(data.pos, data.batch, atol=atol)
 
 
 def subtract_com_vector(samples, n_particles, n_dimensions):

@@ -1,0 +1,143 @@
+# @package _global_
+name: gmm_smoke
+
+# keep outputs local/writable for quick smoke runs
+root: /tmp/tr_asbs_smoke
+
+fabric:
+  accelerator: cpu
+  devices: 1
+  strategy: auto
+  num_nodes: 1
+  loggers:
+    _delete_: true
+    _target_: lightning.pytorch.loggers.CSVLogger
+    save_dir: ${hydra:run.dir}
+    name: csv_logs
+
+seed: 0
+
+################################################################################
+# Potentials
+################################################################################
+potential:
+  _target_: tr_asbs.potential.gmm.GMM
+  dim: 8
+  num_components: 4
+  loc_scaling: 5
+  scale_scaling: 1
+  max_weight_ratio: 3.0
+  uniform_mixing_weights: false
+  softplus: true
+
+################################################################################
+# Settings for Gamma
+################################################################################
+gamma: 1.0
+gamma_schedule: fixed
+trust_region_bound: 0.3
+iw_clip_value: 10
+
+################################################################################
+# Training settings (tiny smoke run)
+################################################################################
+max_outer_loops: 1
+adjoint_matching_epochs: 1
+corrector_matching_epochs: 1
+steps_per_epoch: 2
+train_batch_size: 32
+inference_batch_size: 64
+num_samples_for_dual_loss: [64, 4]
+
+################################################################################
+# Logging
+################################################################################
+log_loss_interval_step: 1
+log_detail_interval_epoch: 1
+monitor_values: []
+progress_bar: false
+visualize: false
+save_samples: false
+
+# Speed up eval phases as well
+eval_samples: 64
+eval_samples_final: 64
+
+################################################################################
+# Models
+################################################################################
+controller:
+  _target_: tr_asbs.model.mlp.FourierMLP
+  dim: ${potential.dim}
+  num_layers: 2
+  channels: 64
+  clip_norm: 100.0
+
+corrector:
+  _target_: tr_asbs.model.mlp.FourierMLP
+  dim: ${potential.dim}
+  num_layers: 2
+  channels: 64
+  clip_norm: 100.0
+
+################################################################################
+# Optimization
+################################################################################
+controller_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+corrector_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+gradient_clip_val: 100.0
+
+################################################################################
+# Buffers
+################################################################################
+adjoint_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 1024
+
+corrector_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 1024
+
+initial_buffer_samples: 64
+buffer_samples_per_epoch: 64
+log_buffer_energy: true
+log_buffer_grad_norm: true
+
+################################################################################
+# Process and integration
+################################################################################
+source:
+  _target_: tr_asbs.process.source.GaussianPrior
+  dim: ${potential.dim}
+  scale: 2.0
+
+base_sde:
+  _target_: tr_asbs.process.sde.VESDE
+  sigma_min: 0.1
+  sigma_max: 1.0
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 8
+    rescale_t: null
+
+################################################################################
+# Terminal cost
+################################################################################
+terminal_cost:
+  _target_: tr_asbs.process.terminal_cost.ASBSTerminalCost
+  grad_clip_val: 100.0
+
+corrector_matching_mode: full

@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 from pathlib import Path
+import inspect
 
 import ase.io
 import hydra
@@ -24,10 +25,7 @@ from omegaconf import OmegaConf
 import uuid
 from copy import deepcopy
 
-from tr_asbs.potential.base_potential import SumPotential
-from tr_asbs.potential.metadynamics import WellTemperedMetadynamicsBias
 from tr_asbs.process.sde import ControlledSDE, ControlledFBSDE
-from tr_asbs.utils.topology import save_data_to_pdb
 from tr_asbs.utils.training import EMA, TrainingCurriculum, copy_model
 from tr_asbs.utils.helper import Checkpointer, CheckpointConfig
 
@@ -39,6 +37,28 @@ def stable_group_id(cfg: dict, exclude=("seed", "name")):
     d = {k: cfg[k] for k in sorted(cfg.keys()) if k not in exclude}
     s = json.dumps(d, sort_keys=True)
     return hashlib.sha1(s.encode()).hexdigest()[:10]
+
+
+def instantiate_logger_compat(logger_cfg: DictConfig):
+    """Instantiate logger while dropping merged keys unsupported by target logger."""
+    target = str(getattr(logger_cfg, "_target_", ""))
+    logger_cls = hydra.utils.get_class(target)
+
+    cfg_dict = OmegaConf.to_container(logger_cfg, resolve=True)
+    if not isinstance(cfg_dict, dict):
+        raise TypeError(f"logger config must be a mapping, got {type(cfg_dict)}")
+
+    cfg_dict.pop("_target_", None)
+    cfg_dict.pop("_delete_", None)
+
+    sig = inspect.signature(logger_cls.__init__)
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+    if accepts_var_kw:
+        return logger_cls(**cfg_dict)
+
+    valid_keys = {name for name in sig.parameters if name != "self"}
+    filtered = {k: v for k, v in cfg_dict.items() if k in valid_keys}
+    return logger_cls(**filtered)
 
 class ASBSModule:
     """Module for ASBS training."""
@@ -54,9 +74,11 @@ class ASBSModule:
         self.cfg = cfg
         random_hash = uuid.uuid4().hex[:8]
         self.group_id = str(stable_group_id(cfg, exclude=("name"))) + f"{random_hash}"
-        cfg.fabric.loggers.group = stable_group_id(cfg)
+        logger_target = str(getattr(cfg.fabric.loggers, "_target_", "")).lower()
+        if "wandb" in logger_target and "group" in cfg.fabric.loggers:
+            cfg.fabric.loggers.group = stable_group_id(cfg)
 
-        wandb_logger = hydra.utils.instantiate(cfg.fabric.loggers)
+        wandb_logger = instantiate_logger_compat(cfg.fabric.loggers)
         full_cfg = OmegaConf.to_container(cfg, resolve=True)
         wandb_logger.log_hyperparams(full_cfg)
         
@@ -376,14 +398,7 @@ class ASBSModule:
             sample_directory = Path(self.cfg.sample_directory)
             if not sample_directory.exists():
                 sample_directory.mkdir(parents=True, exist_ok=True)
-            if hasattr(self.cfg, "topology_pdb_file"):  # Save as PDB instead
-                filename = sample_directory / f"epoch_{self.current_epoch:04d}.pdb"
-                save_data_to_pdb(
-                    data=data,
-                    topology_file=self.cfg.topology_pdb_file,
-                    output_file=str(filename),
-                )
-            elif isinstance(data, torch.Tensor):  # Save as XYZ if data is tensor
+            if isinstance(data, torch.Tensor):  # Save as XYZ if data is tensor
                 filename = sample_directory / f"epoch_{self.current_epoch:04d}.npy"
                 np.save(filename, data.cpu().numpy())
             else:  # default to XYZ format
@@ -773,12 +788,13 @@ class ASBSModule:
 
 @hydra.main(version_base=None, config_path="../config", config_name="train")
 def main(cfg: DictConfig) -> None:
-    os.environ["WANDB_MODE"] = str(cfg.wandb_mode)  # "online" or "offline"
-    os.environ["WANDB_BASE_URL"] = str(cfg.wandb_host)      # 例: "https://wandb.zib.de"
-    os.environ["WANDB_API_KEY"] = str(cfg.wandb_key)
-
-    # (任意) 対話ログインは不要。入れるなら host 引数なしでOK
-    wandb.login(key=os.environ["WANDB_API_KEY"], relogin=True)
+    logger_target = str(getattr(cfg.fabric.loggers, "_target_", "")).lower()
+    use_wandb_logger = "wandb" in logger_target
+    if use_wandb_logger:
+        os.environ["WANDB_MODE"] = str(cfg.wandb_mode)
+        os.environ["WANDB_BASE_URL"] = str(cfg.wandb_host)
+        os.environ["WANDB_API_KEY"] = str(cfg.wandb_key)
+        wandb.login(key=os.environ["WANDB_API_KEY"], relogin=True)
     # NOTE: changing matmul precision may result in mean drift
     torch.set_float32_matmul_precision("high")
     trainer = ASBSModule(cfg)

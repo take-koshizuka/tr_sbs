@@ -5,7 +5,7 @@
 name: tr_asbs
 fabric:
   loggers:
-    tags: [gmm]
+    tags: [ring_gmm]
 
 seed: 0
 
@@ -32,8 +32,8 @@ iw_clip_value: 10
 # Training settings
 ################################################################################
 max_outer_loops: 80
-adjoint_matching_epochs: 25 # todo
-corrector_matching_epochs: 25 # todo
+adjoint_matching_epochs: 150 # todo
+corrector_matching_epochs: 50 # todo
 steps_per_epoch: 100
 train_batch_size: 1000
 inference_batch_size: 10000
@@ -42,7 +42,7 @@ num_samples_for_dual_loss: [5000, 40]
 ################################################################################
 # Logging
 ################################################################################
-log_detail_interval_epoch: 25 # todo
+log_detail_interval_epoch: 200 # todo
 monitor_values: ["loss/neg_avg_energy"]
 
 ################################################################################
@@ -82,11 +82,11 @@ gradient_clip_val: 100.0
 ################################################################################
 adjoint_buffer:
   _target_: tr_asbs.data.buffer.BatchBuffer
-  max_size: 10000 # todo
+  max_size: 50000 # todo
 
 corrector_buffer:
   _target_: tr_asbs.data.buffer.BatchBuffer
-  max_size: 10000 # todo
+  max_size: 50000 # todo
 
 initial_buffer_samples: 10000
 buffer_samples_per_epoch: 10000
@@ -112,7 +112,7 @@ integrator:
     _target_: tr_asbs.process.integrator.get_timesteps
     t0: 0.0
     t1: 1.0
-    steps: 50 # todo
+    steps: 200 # todo
     rescale_t: null
 
 ################################################################################

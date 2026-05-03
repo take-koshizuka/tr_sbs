@@ -42,3 +42,4 @@ EOF
 
 # src/tr_asbs 配下の data だけ
 !/src/tr_asbs/data/
+.idea

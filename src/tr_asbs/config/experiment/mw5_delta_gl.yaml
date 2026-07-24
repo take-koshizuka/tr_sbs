@@ -13,7 +13,7 @@ potential:
   _target_: tr_asbs.potential.ginzburg_landau_energy.GinzburgLandauEnergy
   dim: 8
   m: 5
-  delta: 8.0
+  delta: 4.0
   periodic_boundary: true
   coupling_strength: 1.0
 
@@ -28,9 +28,9 @@ iw_clip_value: 1.0
 ################################################################################
 # Training settings
 ################################################################################
-max_outer_loops: 35
-adjoint_matching_epochs: 100
-corrector_matching_epochs: 100
+max_outer_loops: 80
+adjoint_matching_epochs: 150
+corrector_matching_epochs: 150
 steps_per_epoch: 100
 train_batch_size: 1000
 inference_batch_size: 10000

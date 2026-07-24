@@ -17,6 +17,44 @@ from scipy.optimize import linear_sum_assignment
 
 from tqdm import tqdm
 
+
+def _as_1d_numpy(x: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
+    if torch.is_tensor(x):
+        arr = x.detach().reshape(-1).cpu().numpy()
+    else:
+        arr = np.asarray(x).reshape(-1)
+    if arr.size == 0:
+        raise ValueError("Input samples must be non-empty.")
+    return arr
+
+
+def emd2_1d_samples(
+    samples_a: Union[torch.Tensor, np.ndarray],
+    samples_b: Union[torch.Tensor, np.ndarray],
+) -> torch.Tensor:
+    """
+    1D EMD^2 between two sample sets using POT's `emd2_1d`.
+    Returns a scalar tensor on the same device/dtype as `samples_a` when tensor.
+    """
+    a = _as_1d_numpy(samples_a)
+    b = _as_1d_numpy(samples_b)
+    val = float(pot.emd2_1d(a, b))
+    if torch.is_tensor(samples_a):
+        return torch.tensor(val, device=samples_a.device, dtype=samples_a.dtype)
+    return torch.tensor(val, dtype=torch.get_default_dtype())
+
+
+def w2_1d_samples(
+    samples_a: Union[torch.Tensor, np.ndarray],
+    samples_b: Union[torch.Tensor, np.ndarray],
+) -> torch.Tensor:
+    """
+    1D Wasserstein-2 distance between two sample sets.
+    """
+    emd2 = emd2_1d_samples(samples_a, samples_b)
+    return torch.sqrt(torch.clamp(emd2, min=0.0))
+
+
 def compute_distribution_distances(
     pred: torch.Tensor,
     true: torch.Tensor,

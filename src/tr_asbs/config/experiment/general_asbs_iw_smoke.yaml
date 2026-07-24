@@ -1,0 +1,120 @@
+# @package _global_
+name: general_asbs_iw_smoke
+
+root: /tmp/tr_asbs_smoke
+
+fabric:
+  _target_: lightning.fabric.Fabric
+  accelerator: cpu
+  devices: 1
+  strategy: auto
+  num_nodes: 1
+  loggers:
+    _target_: lightning.pytorch.loggers.CSVLogger
+    save_dir: ${hydra:run.dir}
+    name: csv_logs
+
+seed: 0
+
+potential:
+  _target_: tr_asbs.potential.gmm.GMM
+  dim: 8
+  num_components: 4
+  loc_scaling: 5
+  scale_scaling: 1
+  max_weight_ratio: 3.0
+  uniform_mixing_weights: false
+  softplus: true
+
+gamma: 1.0
+gamma_schedule: fixed
+trust_region_bound: 0.3
+iw_clip_value: 10.0
+
+max_outer_loops: 1
+adjoint_matching_epochs: 1
+corrector_matching_epochs: 1
+steps_per_epoch: 1
+train_batch_size: 16
+inference_batch_size: 16
+num_samples_for_dual_loss: [32, 4]
+
+log_loss_interval_step: 1
+log_detail_interval_epoch: 1
+monitor_values: []
+progress_bar: false
+visualize: false
+save_samples: false
+eval_samples: 16
+eval_samples_final: 16
+
+controller:
+  _target_: tr_asbs.model.mlp.FourierMLP
+  dim: ${potential.dim}
+  num_layers: 2
+  channels: 32
+  clip_norm: 100.0
+
+corrector:
+  _target_: tr_asbs.model.mlp.FourierMLP
+  dim: ${potential.dim}
+  num_layers: 2
+  channels: 32
+  clip_norm: 100.0
+
+controller_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+corrector_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+gradient_clip_val: 100.0
+
+adjoint_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 1024
+
+corrector_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 1024
+
+initial_buffer_samples: 16
+buffer_samples_per_epoch: 16
+log_buffer_energy: false
+log_buffer_grad_norm: false
+
+source:
+  _target_: tr_asbs.process.source.GaussianPrior
+  dim: ${potential.dim}
+  scale: 2.0
+
+base_sde:
+  _target_: tr_asbs.process.sde.VESDE
+  sigma_min: 0.1
+  sigma_max: 1.0
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 8
+    rescale_t: null
+
+terminal_cost:
+  _target_: tr_asbs.process.terminal_cost.ASBSTerminalCost
+  grad_clip_val: 100.0
+
+corrector_matching_mode: full
+
+backward_loss_mode: score_matching
+backward_loss_terms: [score_matching]
+score_matching_weight: 1.0
+consistency_loss_weight: 0.0
+consistency_loss_full_path_weight: 0.0
+consistency_var_full_path_weight: 0.0

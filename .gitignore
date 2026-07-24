@@ -1,45 +1,69 @@
-cat << 'EOF' > .gitignore
-# ===== Logs =====
-slurm-*.out
-
-# ===== Shell scripts (exclude) =====
-*.sh
-
-# ===== Python =====
+# Python bytecode and caches
 __pycache__/
-*.pyc
-*.pyo
-
-# ===== Environments / cache =====
-.venv/
-.ruff_cache/
-.mypy_cache/
+*.py[cod]
+*$py.class
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+.ipynb_checkpoints/
 
-# ===== Data & models =====
-*.pt
-*.model
-*.ckpt
-*.pth
-*.npz
+# Python packaging
+build/
+dist/
+*.egg-info/
+.eggs/
 
-# ===== macOS garbage =====
+# Virtual environments and local environment variables
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+
+# Editors and operating-system files
+.idea/
+.vscode/
 .DS_Store
+Thumbs.db
 __MACOSX/
 ._*
 
-# ===== HuggingFace / Hydra =====
-.hydra/
-checkpoints/
+# Experiment tracking and generated run directories
+/runs/
+/smoke_runs/
+/sweep_runs/
+/wandb/
+/outputs/
+/multirun/
+**/.hydra/
+**/checkpoints/
+**/samples/
 
-# ===== Misc =====
-None
-EOF
+# Logs and scheduler output
+*.log
+slurm-*.out
 
-# ルート直下の data
+# Trained models and checkpoints
+*.pt
+*.pth
+*.ckpt
+*.model
+
+# Local datasets and generated numerical data
 /data/
+*.npy
+*.npz
 
-# src/tr_asbs 配下の data だけ
-!/src/tr_asbs/data/
-.idea
+# Temporary files
+*.tmp
+*.temp
+*.swp
+*.swo
+*~

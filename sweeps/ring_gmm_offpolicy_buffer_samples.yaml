@@ -1,0 +1,19 @@
+program: tr_asbs.experiment.train_gamma_asbs_offpolicy
+method: grid
+metric:
+  name: loss/neg_avg_energy
+  goal: minimize
+command:
+  - ${env}
+  - uv
+  - run
+  - python
+  - -m
+  - ${program}
+  - experiment=ring_gmm
+  - name=ring_gmm_offpolicy_buffer_samples
+  - inference_batch_size=100
+  - ${args_no_hyphens}
+parameters:
+  buffer_samples_per_epoch:
+    values: [100, 200, 500, 1000]

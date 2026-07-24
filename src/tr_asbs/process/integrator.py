@@ -13,16 +13,9 @@ import torch.nn as nn
 from tqdm import tqdm
 
 from tr_asbs.process.sde import BaseSDE, FwdBwdSDE, DataType
-from tr_asbs.utils.geometry import subtract_mean_batch, subtract_com_vector
+from tr_asbs.utils.geometry import subtract_com_vector
 from tr_asbs.utils.gaussian_utils import gaussian_log_prob
 
-
-def _is_graph_data(data: DataType) -> bool:
-    return hasattr(data, "pos") and hasattr(data, "batch")
-
-
-def _data_device(data: DataType) -> torch.device:
-    return data.pos.device if _is_graph_data(data) else data.device
 
 def get_timesteps(
     t0: torch.Tensor | float,
@@ -73,9 +66,8 @@ class BaseIntegrator(nn.Module, ABC):
         data: DataType,
         time: torch.Tensor,
         dt: torch.Tensor,
-        zero_noise: bool = False,
-    ) -> DataType:
-        """Perform a single step of the forward SDE integration."""
+    ) -> Tuple[DataType, DataType]:
+        """Return (deterministic_next, stochastic_next) for one forward step."""
         pass
 
     
@@ -109,7 +101,7 @@ class BaseIntegrator(nn.Module, ABC):
                 raise ValueError("No timesteps provided and no default timesteps set.")
             timesteps = self.timesteps
 
-        timesteps = timesteps.to(_data_device(initial_data))
+        timesteps = timesteps.to(initial_data.device)
         data = initial_data.clone() if hasattr(initial_data, "clone") else initial_data
 
         trajectory = [data] if return_trajectory else []
@@ -120,12 +112,8 @@ class BaseIntegrator(nn.Module, ABC):
 
         for i in iterator:
             dt = timesteps[i + 1] - timesteps[i]
-            data = self.step(
-                data,
-                time=timesteps[i],
-                dt=dt,
-                zero_noise=(zero_last_step_noise and i == len(timesteps) - 2),
-            )
+            deterministic_next, stochastic_next = self.step(data, time=timesteps[i], dt=dt)
+            data = deterministic_next if (zero_last_step_noise and i == len(timesteps) - 2) else stochastic_next
             
             # Center of Mass correction (optional)
             if center_every_step:
@@ -141,11 +129,7 @@ class BaseIntegrator(nn.Module, ABC):
     # ---------- Utilities ----------
     def _apply_centering(self, data: DataType):
         """Helper to apply CoM centering."""
-        if _is_graph_data(data):
-            data.pos = subtract_mean_batch(data.pos, data.batch)
-        else:
-            data = subtract_com_vector(data, data.shape[-2], data.shape[-1])
-        return data
+        return subtract_com_vector(data, data.shape[-2], data.shape[-1])
         
     @abstractmethod
     @torch.no_grad()
@@ -154,10 +138,9 @@ class BaseIntegrator(nn.Module, ABC):
         data: DataType,
         time: torch.Tensor,
         dt: torch.Tensor,  # distinct from forward dt, usually positive magnitude
-        zero_noise: bool = False,
-    ) -> DataType:
+    ) -> Tuple[DataType, DataType]:
         """
-        Perform a single step of the reverse SDE integration.
+        Return (deterministic_prev, stochastic_prev) for one reverse step.
         """
         pass
     
@@ -177,7 +160,7 @@ class BaseIntegrator(nn.Module, ABC):
                 raise ValueError("No timesteps provided and no default timesteps set.")
             timesteps = self.timesteps
         
-        timesteps = timesteps.to(_data_device(final_data))
+        timesteps = timesteps.to(final_data.device)
         assert timesteps[0] < timesteps[-1], "Timesteps should be in ascending order."
         # Reverse the timesteps
         times = timesteps.flip(0)
@@ -193,12 +176,8 @@ class BaseIntegrator(nn.Module, ABC):
             t_next = times[i+1] # This is actually 'previous' time in forward sense
             dt = t_current - t_next # Positive magnitude > 0
             
-            data = self.step_backward(
-                data,
-                time=t_current,
-                dt=dt,
-                zero_noise=(zero_last_step_noise and i == len(times) - 2),
-            )
+            deterministic_prev, stochastic_prev = self.step_backward(data, time=t_current, dt=dt)
+            data = deterministic_prev if (zero_last_step_noise and i == len(times) - 2) else stochastic_prev
 
             if center_every_step:
                 data = self._apply_centering(data)
@@ -231,13 +210,12 @@ class BaseIntegrator(nn.Module, ABC):
                 raise ValueError("No timesteps provided.")
             timesteps = self.timesteps
 
-        timesteps = timesteps.to(_data_device(initial_data))
-        is_graph = _is_graph_data(initial_data)
+        timesteps = timesteps.to(initial_data.device)
         data = initial_data
-        device = _data_device(data)
+        device = data.device
 
-        batch_size = initial_data.pos.shape[0] if is_graph else initial_data.shape[0]
-        D = data.pos.shape[1] if is_graph else data.reshape(batch_size, -1).shape[1]
+        batch_size = initial_data.shape[0]
+        D = data.reshape(batch_size, -1).shape[1]
         log_Pref_Ph = torch.zeros(batch_size, device=device) # log(P_ref / P_backward)
         log_Pref_Pu = torch.zeros(batch_size, device=device) # log(P_ref / P_forward_model)
         log_Pref_Pu_det = torch.zeros(batch_size, device=device) # Low variance version
@@ -249,36 +227,36 @@ class BaseIntegrator(nn.Module, ABC):
         
         if progress_bar:
             iterator = tqdm(iterator, desc="sdeint", leave=False)
+
+        same_integrator = integrator is self
         
         for i in iterator:
             t = timesteps[i]
             t_next = timesteps[i+1]
             dt = t_next - t
-            # 1. Step Forward (Reference Process - self)
-            # We assume step returns just data. Energy calc might be inside step or needed separately.
-            # Here we follow the pattern of calling step(), but for weights we usually need drift/diff separately.
+            # Single forward call for reference: deterministic and stochastic outcomes are returned together.
+            fwd_mean_ref, next_data_stochastic = self.step(data, time=t, dt=dt)
+            if same_integrator:
+                fwd_mean = fwd_mean_ref
+            else:
+                fwd_mean, _ = integrator.step(data.clone(), time=t, dt=dt)
+
+            is_last_step = i == len(timesteps) - 2
+            next_data = fwd_mean_ref if (zero_last_step_noise and is_last_step) else next_data_stochastic
             
-            # To get exact drift/diff for KL, we calculate them BEFORE the update
-            fwd_mean_ref = self.step(data.clone(), time=t, dt=dt, zero_noise=True)
-            fwd_mean = integrator.step(data.clone(), time=t, dt=dt, zero_noise=True)
-            next_data = self.step(data, time=t, dt=dt)
-            bwd_mean = integrator.step_backward(next_data.clone(), time=t_next, dt=dt, zero_noise=True)
+            if center_every_step:
+                next_data = self._apply_centering(next_data)
+                
+            bwd_mean, _ = integrator.step_backward(next_data.clone(), time=t_next, dt=dt)
             
             # Perform the update
             diff_sq = self.sde.base_sde.diffsquare_integral(t_next) - self.sde.base_sde.diffsquare_integral(t)
             sigma_step = diff_sq.clamp(min=1e-20).sqrt()
-            if is_graph:
-                fwd_ref_pos = fwd_mean_ref.pos
-                fwd_pos = fwd_mean.pos
-                next_pos = next_data.pos
-                bwd_pos = bwd_mean.pos
-                data_pos = data.pos
-            else:
-                fwd_ref_pos = fwd_mean_ref
-                fwd_pos = fwd_mean
-                next_pos = next_data
-                bwd_pos = bwd_mean
-                data_pos = data
+            fwd_ref_pos = fwd_mean_ref
+            fwd_pos = fwd_mean
+            next_pos = next_data
+            bwd_pos = bwd_mean
+            data_pos = data
 
             diff_means = (fwd_ref_pos - fwd_pos).reshape(batch_size, D)
             var_step = sigma_step.pow(2)
@@ -311,9 +289,6 @@ class BaseIntegrator(nn.Module, ABC):
 
             log_Pref_Ph += (log_prob_ref_step - log_prob_model_bwd_step)
             log_Pref_Pu += (log_prob_ref_step - log_prob_model_fwd_step)
-
-            if center_every_step:
-                next_data = self._apply_centering(next_data)
                 
             # Update state
             data = next_data
@@ -341,24 +316,13 @@ class EulerMaruyamaIntegrator(BaseIntegrator):
         data: DataType,
         time: torch.Tensor,  # scalar
         dt: torch.Tensor,  # scalar
-        zero_noise: bool = False,
-    ) -> DataType:
-        """Perform a single step of the Euler-Maruyama integration."""
+    ) -> Tuple[DataType, DataType]:
+        """Return deterministic and stochastic next states for Euler-Maruyama."""
         drift = self.sde.drift(time, data) * dt
-        if zero_noise:
-            if _is_graph_data(data):
-                data.pos = data.pos + drift
-            else:
-                data = data + drift
-            return data
-        
         diffusion = self.sde.diffusion(time) * dt.sqrt() * self.sde.randn_like(data)
-        if _is_graph_data(data):
-            data.pos = data.pos + drift + diffusion
-        else:
-            data = data + drift + diffusion
-            
-        return data
+        deterministic_next = data + drift
+        stochastic_next = deterministic_next + diffusion
+        return deterministic_next, stochastic_next
     
 class ExponentialIntegrator(BaseIntegrator):
     """Exponential integrator for SDEs."""
@@ -369,24 +333,14 @@ class ExponentialIntegrator(BaseIntegrator):
         data: DataType,
         time: torch.Tensor,  # scalar
         dt: torch.Tensor,  # scalar
-        zero_noise: bool = False,
-    ) -> DataType:
-        """Perform a single step of the Exponential integration."""
+    ) -> Tuple[DataType, DataType]:
+        """Return deterministic and stochastic next states for exponential integrator."""
         drift = self.sde.drift(time, data) * dt
-        if zero_noise:
-            if _is_graph_data(data):
-                data.pos = data.pos + drift
-            else:
-                data = data + drift
-            return data
-        
         diff_sq = self.sde.base_sde.diffsquare_integral(time + dt) - self.sde.base_sde.diffsquare_integral(time)
         diffusion = diff_sq.sqrt() * self.sde.randn_like(data)
-        if _is_graph_data(data):
-            data.pos = data.pos + drift + diffusion
-        else:
-            data = data + drift + diffusion
-        return data
+        deterministic_next = data + drift
+        stochastic_next = deterministic_next + diffusion
+        return deterministic_next, stochastic_next
     
     @torch.no_grad()
     def step_backward(
@@ -394,22 +348,11 @@ class ExponentialIntegrator(BaseIntegrator):
         data: DataType,
         time: torch.Tensor,  # scalar
         dt: torch.Tensor,  # scalar
-        zero_noise: bool = False,
-    ) -> DataType:
-        """Perform a single step of the Exponential integration backward."""
+    ) -> Tuple[DataType, DataType]:
+        """Return deterministic and stochastic previous states for reverse exponential step."""
         drift = (-self.sde.bwd_drift(time, data)) * (-dt)
-        if zero_noise:
-            if _is_graph_data(data):
-                data.pos = data.pos + drift
-            else:
-                data = data + drift
-            return data
-        
         diff_sq = self.sde.base_sde.diffsquare_integral(time) - self.sde.base_sde.diffsquare_integral(time - dt)
         diffusion = diff_sq.sqrt() * self.sde.randn_like(data)
-        if _is_graph_data(data):
-            data.pos = data.pos + drift + diffusion
-        else:
-            data = data + drift + diffusion
-            
-        return data
+        deterministic_prev = data + drift
+        stochastic_prev = deterministic_prev + diffusion
+        return deterministic_prev, stochastic_prev

@@ -709,9 +709,11 @@ class ASBSModule:
                 'predict_drift_fn': self.sde.drift,
             }
         
+        force_log_gt = getattr(self.potential, "name", "") == "ring_gmm"
+
         if self.current_epoch == 0:
             logs = self.potential.log_details(results, visualize=visualize)
-            if self.cfg.visualize:
+            if visualize or force_log_gt:
                 logs["figures/gt_data_0"] = self.potential.visualize_raw(data_0, title="gt_data_0")
                 logs["figures/gt_data_1"] = self.potential.visualize(self.potential.sample(data_0.shape[0:1]), title="gt_data_1")
         else:

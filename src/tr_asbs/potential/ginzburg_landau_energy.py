@@ -3,10 +3,12 @@ from typing import Dict, Optional, Sequence, Tuple
 import math
 
 import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import wandb
 
 from .base_energy import BaseEnergy
+from ..utils.distribution_distance import emd2_1d_samples
 from ..utils.eval_logweight import compute_log_weights_metrics
 
 
@@ -64,8 +66,7 @@ class GinzburgLandauEnergy(BaseEnergy):
     Energy-only Ginzburg-Landau target.
 
     This class intentionally does not provide log_Z or ground-truth sampling.
-    Visualization overlays a normalized 1D energy-slice density, not the true
-    marginal density.
+    Visualization shows sample histograms and energy histograms.
     """
 
     def __init__(
@@ -116,19 +117,6 @@ class GinzburgLandauEnergy(BaseEnergy):
         raise NotImplementedError("Ground-truth sampling is not implemented for GinzburgLandauEnergy.")
 
     @torch.no_grad()
-    def _energy_slice_density(
-        self,
-        dim: int,
-        xs: torch.Tensor,
-    ) -> torch.Tensor:
-        points = torch.zeros(xs.shape[0], self.dim, device=self.device, dtype=xs.dtype)
-        points[:, dim] = xs
-        energy = self.eval(points)
-        density = torch.exp(-(energy - energy.min()))
-        dx = (xs[1] - xs[0]).abs()
-        return density / (density.sum() * dx).clamp_min(1e-12)
-
-    @torch.no_grad()
     def visualize(
         self,
         samples: torch.Tensor,
@@ -149,8 +137,6 @@ class GinzburgLandauEnergy(BaseEnergy):
             raise ValueError(f"No valid dims to plot (samples have D={sample_dim}).")
 
         bound = self._plot_bound
-        xs = torch.linspace(-bound, bound, 1000, device=self.device, dtype=samples.dtype)
-        xs_np = xs.detach().cpu().numpy()
 
         plt.close()
         fig, axes = plt.subplots(2, 2, figsize=figsize, squeeze=False)
@@ -158,14 +144,12 @@ class GinzburgLandauEnergy(BaseEnergy):
 
         for ax, dim in zip(axes_flat[: min(3, len(dims))], dims[:3]):
             x = samples[:, dim].detach().cpu().numpy()
-            slice_density = self._energy_slice_density(dim, xs).detach().cpu().numpy()
 
             ax.hist(x, bins=bins, density=True, alpha=alpha, label=f"samples (dim {dim})")
-            ax.plot(xs_np, slice_density, linewidth=2.0, label="energy-slice density")
             ax.set_xlim(-bound, bound)
             ax.set_xlabel(f"x_{dim}")
             ax.set_ylabel("density")
-            ax.set_title(f"1D histogram + slice density (dim {dim})")
+            ax.set_title(f"1D histogram (dim {dim})")
             ax.legend(loc="best")
 
         used = min(3, len(dims))
@@ -188,6 +172,98 @@ class GinzburgLandauEnergy(BaseEnergy):
             wb_key = f"figures/vis_ginzburg_landau_{title}"
 
         fig.tight_layout(rect=[0, 0, 1, 0.97])
+
+        if use_wandb:
+            dim0 = samples[:, 0].detach().cpu().numpy()
+            fig_dim0, ax_dim0 = plt.subplots(1, 1, figsize=(6, 4))
+            ax_dim0.hist(dim0, bins=bins, density=True, alpha=alpha, label="samples (dim 0)")
+            ax_dim0.set_xlim(-bound, bound)
+            ax_dim0.set_xlabel("x_0")
+            ax_dim0.set_ylabel("density")
+            ax_dim0.set_title("1D histogram (dim 0)")
+            ax_dim0.legend(loc="best")
+            fig_dim0.tight_layout()
+
+            wb = {
+                wb_key: [wandb.Image(fig)],
+                f"{wb_key}_dim0_hist": [wandb.Image(fig_dim0)],
+            }
+            plt.close(fig)
+            plt.close(fig_dim0)
+            return wb
+        return fig
+
+    @torch.no_grad()
+    def _symmetry_violation_metrics(self, samples: torch.Tensor, bins: int = 100) -> Dict[str, torch.Tensor]:
+        samples = samples.reshape(-1, samples.shape[-1]).detach()
+        mean_vec = samples.mean(dim=0)
+        odd3_vec = (samples**3).mean(dim=0)
+        w2_per_dim = []
+        for dim in range(samples.shape[1]):
+            x_dim = samples[:, dim]
+            emd2 = emd2_1d_samples(x_dim, -x_dim)
+            w2_per_dim.append(torch.sqrt(torch.clamp(emd2, min=0.0)))
+        w2_tensor = torch.stack(w2_per_dim)
+        x0_std = samples[:, 0].std(unbiased=False).clamp_min(1e-12)
+
+        return {
+            "first_moment_norm": torch.linalg.vector_norm(mean_vec).detach().cpu(),
+            "odd3_moment_norm": torch.linalg.vector_norm(odd3_vec).detach().cpu(),
+            "w2_x0_mirror": w2_tensor[0].detach().cpu(),
+            "w2_x0_mirror_norm": (w2_tensor[0] / x0_std).detach().cpu(),
+            "w2_mirror_mean": w2_tensor.mean().detach().cpu(),
+            "w2_mirror_sum": w2_tensor.sum().detach().cpu(),
+            "w2_mirror_max": w2_tensor.max().detach().cpu(),
+        }
+
+    @torch.no_grad()
+    def visualize_symmetry_violation(
+        self,
+        samples: torch.Tensor,
+        title: Optional[str] = None,
+        bins: int = 100,
+        use_wandb: bool = True,
+    ):
+        samples = samples.reshape(-1, samples.shape[-1]).to(self.device)
+        metrics = self._symmetry_violation_metrics(samples, bins=bins)
+        bound = self._plot_bound
+        samples_np = samples.detach().cpu().numpy()
+        dim_ids = np.arange(samples_np.shape[1])
+        w2_per_dim = []
+        for dim in range(samples_np.shape[1]):
+            emd2 = emd2_1d_samples(samples[:, dim], -samples[:, dim])
+            w2_per_dim.append(float(torch.sqrt(torch.clamp(emd2, min=0.0)).detach().cpu()))
+        w2_per_dim = np.asarray(w2_per_dim, dtype=np.float64)
+
+        plt.close()
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4), squeeze=False)
+        ax_l, ax_r = axes[0, 0], axes[0, 1]
+
+        x0 = samples_np[:, 0]
+        ax_l.hist(x0, bins=bins, range=(-bound, bound), density=True, alpha=0.6, label="x_0")
+        ax_l.hist(-x0, bins=bins, range=(-bound, bound), density=True, alpha=0.6, label="-x_0")
+        ax_l.set_xlim(-bound, bound)
+        ax_l.set_xlabel("value")
+        ax_l.set_ylabel("density")
+        ax_l.set_title("Dim 0 vs mirrored")
+        ax_l.legend(loc="best")
+
+        ax_r.bar(dim_ids, w2_per_dim)
+        ax_r.set_xlabel("dim")
+        ax_r.set_ylabel("W2(x_i, -x_i)")
+        ax_r.set_title("Per-dim symmetry violation")
+
+        fig.suptitle(
+            f"symmetry: ||E[x]||={float(metrics['first_moment_norm']):.3e}, "
+            f"||E[x^3]||={float(metrics['odd3_moment_norm']):.3e}, "
+            f"W2mean={float(metrics['w2_mirror_mean']):.3e}"
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.92])
+
+        if title is None:
+            wb_key = "figures/vis_ginzburg_landau_symmetry"
+        else:
+            wb_key = f"figures/vis_ginzburg_landau_symmetry_{title}"
 
         if use_wandb:
             wb = {wb_key: [wandb.Image(fig)]}
@@ -215,12 +291,19 @@ class GinzburgLandauEnergy(BaseEnergy):
     def log_details(self, results: dict, prefix: str = "", visualize: bool = True) -> Dict:
         data_1 = results["data_1"]
         energy = self.eval(data_1)
+        sym = self._symmetry_violation_metrics(data_1)
 
         logs = {
             f"{prefix}loss/neg_avg_energy": energy.mean().detach().cpu(),
             f"{prefix}energy/std": energy.std(unbiased=False).detach().cpu(),
             f"{prefix}energy/min": energy.min().detach().cpu(),
             f"{prefix}energy/max": energy.max().detach().cpu(),
+            f"{prefix}symmetry/first_moment_norm": sym["first_moment_norm"],
+            f"{prefix}symmetry/odd3_moment_norm": sym["odd3_moment_norm"],
+            f"{prefix}symmetry/w2_x0_mirror": sym["w2_x0_mirror"],
+            f"{prefix}symmetry/w2_x0_mirror_norm": sym["w2_x0_mirror_norm"],
+            f"{prefix}symmetry/w2_mirror_mean": sym["w2_mirror_mean"],
+            f"{prefix}symmetry/w2_mirror_max": sym["w2_mirror_max"],
         }
 
         for name, value in results.items():
@@ -245,6 +328,7 @@ class GinzburgLandauEnergy(BaseEnergy):
 
         if visualize:
             logs.update(self.visualize(data_1, title=f"{prefix}data_1"))
+            logs.update(self.visualize_symmetry_violation(data_1, title=f"{prefix}data_1"))
 
         if prefix == "":
             if "lm" in results:

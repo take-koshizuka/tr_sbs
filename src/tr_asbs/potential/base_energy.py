@@ -8,7 +8,6 @@ import os
 
 import torch
 import numpy as np
-import ot as pot
 
 import wandb
 import matplotlib.pyplot as plt
@@ -18,6 +17,7 @@ from pathlib import Path
 from ..utils.distribution_distance import (
     compute_distribution_distances,
     compute_eot,
+    w2_1d_samples,
 )
 from ..utils.eval_logweight import compute_log_weights_metrics
 from ..utils.geometry import subtract_com_vector
@@ -99,7 +99,7 @@ class BaseEnergy:
         gt_samples = self.sample(energies.shape[0])
         gt_samples = gt_samples.view(gt_samples.shape[0], -1).detach()
         gt_energies = -self.eval(gt_samples)
-        energy_w2 = pot.emd2_1d(energies.cpu().numpy(), gt_energies.cpu().numpy()) ** 0.5
+        energy_w2 = w2_1d_samples(energies, gt_energies).detach().cpu()
         return {"energy_W_2": energy_w2}
     
     def log_details(self, results: dict, prefix="", visualize=True) -> dict:

@@ -2,8 +2,8 @@
 defaults:
   - _self_
   - experiment: ring_gmm
-
-root: /scratch/htc/tkoshizuka/tr_asbs
+root: ${oc.env:TR_ASBS_ROOT,/scratch/htc/tkoshizuka/tr_asbs}
+# root: /scratch/htc/tkoshizuka/tr_asbs
 seed: 0
 
 hydra:
@@ -31,6 +31,14 @@ resume: false
 ema_decay: null
 ema_start_step: 0
 visualize: false
+
+# backward loss defaults (used by train_general_asbs_iw.py)
+backward_loss_mode: score_matching
+backward_loss_terms: [score_matching]
+score_matching_weight: 1.0
+consistency_loss_weight: 0.0
+consistency_loss_full_path_weight: 0.0
+consistency_var_full_path_weight: 0.0
 
 fabric:
   _target_: lightning.fabric.Fabric

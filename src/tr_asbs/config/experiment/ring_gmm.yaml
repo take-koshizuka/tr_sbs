@@ -17,7 +17,10 @@ potential:
 
   device: cuda
   dim: 2 # todo
+  num_components: 4
+  weight_layout: up_down
   radius: 10
+  scale: 0.5
   log_Z: 0
 
 ################################################################################
@@ -33,10 +36,10 @@ iw_clip_value: 10
 ################################################################################
 max_outer_loops: 80
 adjoint_matching_epochs: 150 # todo
-corrector_matching_epochs: 50 # todo
+corrector_matching_epochs: 150 # todo
 steps_per_epoch: 100
 train_batch_size: 1000
-inference_batch_size: 10000
+inference_batch_size: 100
 num_samples_for_dual_loss: [5000, 40]
 
 ################################################################################
@@ -89,7 +92,7 @@ corrector_buffer:
   max_size: 50000 # todo
 
 initial_buffer_samples: 10000
-buffer_samples_per_epoch: 10000
+buffer_samples_per_epoch: 250
 log_buffer_energy: true
 log_buffer_grad_norm: true
 
@@ -104,7 +107,7 @@ source:
 base_sde:
   _target_: tr_asbs.process.sde.VESDE
   sigma_min: 0.1
-  sigma_max: 2.0
+  sigma_max: 1.0
 
 integrator:
   _target_: tr_asbs.process.integrator.ExponentialIntegrator

@@ -7,10 +7,10 @@ import torch.nn as nn
 import torch.distributions as D
 import matplotlib.pyplot as plt
 import wandb
-import ot as pot
 from scipy.integrate import quad
 
 from .base_energy import BaseEnergy
+from ..utils.distribution_distance import emd2_1d_samples
 
 class ManyWellPotential:
     """
@@ -384,7 +384,7 @@ class ManyWellEnergy(BaseEnergy):
 
         emds = []
         for i in range(D2):
-            emd_i = pot.emd2_1d(samples[:, i], gt_samples[:, i])
+            emd_i = emd2_1d_samples(samples[:, i], gt_samples[:, i])
             emds.append(emd_i.squeeze())
         emd_per_dim = torch.stack(emds)  # (D2,)
 

@@ -4,6 +4,8 @@ from typing import Optional
 import torch
 from abc import ABC, abstractmethod
 import matplotlib.pyplot as plt
+from matplotlib.collections import LineCollection
+from matplotlib.colors import Normalize
 import ot as pot
 import numpy as np
 from tr_asbs.potential.base_energy import BaseEnergy
@@ -249,23 +251,40 @@ class MixtureTarget(BaseEnergy, torch.nn.Module):
 class RingGMM(MixtureTarget):
     def __init__(self, device, dim: int, radius: float = 4.0, scale: float = 1.0,
                  log_Z: float = 0., can_sample: bool = True, dtype: torch.dtype = torch.float32,
+                 num_components: int = 9, weight_layout: str = "ascending",
 ):
-        # We specifically want 9 components
-        num_components = 9
+        if num_components < 2:
+            raise ValueError(f"num_components must be >= 2, got {num_components}")
+
         super().__init__(dim, num_components, log_Z, can_sample)
 
         self.device = device
         self.name = 'ring_gmm'
         self.dtype = dtype
         self.n_mixes = num_components
-        # 1. Different mixture weights for all 9 Gaussians
-        # We create linearly increasing weights [1, 2, 3, 4, 5, 6, 7, 8, 9]
-        # which will be normalized in the component_weights property.
-        weights = torch.arange(1, num_components + 1, dtype=torch.float32)
+
+        # 1. Mixture weights
+        if weight_layout == "ascending":
+            weights = torch.arange(1, num_components + 1, dtype=torch.float32)
+        elif weight_layout == "up_down":
+            if num_components % 2 != 0:
+                raise ValueError(
+                    "weight_layout='up_down' requires an even num_components so the "
+                    "smallest and largest components can be placed opposite each other."
+                )
+            left = torch.arange(1, num_components // 2 + 1, dtype=torch.float32)
+            peak = torch.tensor([num_components], dtype=torch.float32)
+            right = torch.arange(num_components - 1, num_components // 2, -1, dtype=torch.float32)
+            weights = torch.cat([left, peak, right])
+        else:
+            raise ValueError(
+                f"Unknown weight_layout={weight_layout!r}. Supported: 'ascending', 'up_down'."
+            )
+
         self.register_buffer("cat_probs", weights)
 
-        # 2. Arrange 9 Gaussians on a ring
-        # Calculate the angles for 9 equally spaced points along a circle
+        # 2. Arrange Gaussians on a ring
+        # Calculate equally spaced points along a circle
         theta = torch.linspace(0, 2 * math.pi, num_components + 1)[:-1]
 
         locs = torch.zeros((num_components, dim))
@@ -353,7 +372,7 @@ class RingGMM(MixtureTarget):
     @torch.no_grad()
     def tvd(self, samples: torch.Tensor, soft: bool=False) -> torch.Tensor:
         pi_hat = self.pi_hat(samples, soft=soft)
-        mixture_probs = self.cat_probs.to(self.device, self.dtype)  # [K]
+        mixture_probs = self.component_weights.to(self.device, self.dtype)  # [K]
         return 0.5 * torch.abs(pi_hat - mixture_probs).sum()
 
     def log_details(self, results: dict, prefix: str = "", visualize=True) -> dict:
@@ -374,7 +393,95 @@ class RingGMM(MixtureTarget):
         logs[f"loss/{prefix}tvd"] = tvd_val_hard.item()
         logs[f"loss/{prefix}mode_tvd"] = mode_tvd
         logs.update(self.visualize_2d_and_weights(pred_samples, show=True))
+        if visualize and {"data_0", "data_1", "iw_debug"} <= results.keys():
+            gamma_val = results.get("iw_debug_gamma_value", None)
+            logs.update(
+                self.visualize_iw_paths_2d(
+                    data_0=results["data_0"],
+                    data_1=results["data_1"],
+                    iw=results["iw_debug"],
+                    title=f"{prefix}iw_path_debug_gamma",
+                    gamma_value=gamma_val,
+                    show=True,
+                )
+            )
+        if visualize and {"data_0", "data_1", "iw_debug_no_gamma"} <= results.keys():
+            logs.update(
+                self.visualize_iw_paths_2d(
+                    data_0=results["data_0"],
+                    data_1=results["data_1"],
+                    iw=results["iw_debug_no_gamma"],
+                    title=f"{prefix}iw_path_debug_no_gamma",
+                    gamma_value=None,
+                    show=True,
+                )
+            )
         return logs
+
+    def visualize_iw_paths_2d(
+        self,
+        data_0: torch.Tensor,
+        data_1: torch.Tensor,
+        iw: torch.Tensor,
+        title: str = "iw_path_debug",
+        gamma_value: Optional[float] = None,
+        max_paths: int = 400,
+        show: bool = True,
+    ) -> dict:
+        """Overlay X0->X1 segments on ring-GMM contours, colored by per-pair IW."""
+        import wandb
+
+        if data_0.shape[-1] < 2 or data_1.shape[-1] < 2:
+            return {}
+
+        x0 = data_0.detach().cpu()
+        x1 = data_1.detach().cpu()
+        iw_cpu = iw.detach().cpu().reshape(-1)
+
+        n = min(x0.shape[0], x1.shape[0], iw_cpu.shape[0], max_paths)
+        if n <= 0:
+            return {}
+
+        idx = torch.linspace(0, x0.shape[0] - 1, steps=n).long()
+        x0 = x0[idx, :2].numpy()
+        x1 = x1[idx, :2].numpy()
+        iw_np = iw_cpu[idx].numpy()
+
+        fig, ax = plt.subplots(1, 1, figsize=(8, 7), dpi=80)
+        projected_target_density = self.get_distribution_2D(0, 1)
+
+        def log_prob_2d(x):
+            return projected_target_density.log_prob(x.to(self.device)).cpu()
+
+        plot_density(ax, log_prob_2d, plot_bounds=self._plot_bounds)
+
+        segments = np.stack([x0, x1], axis=1)
+        norm = Normalize(vmin=float(iw_np.min()), vmax=float(iw_np.max()))
+        lc = LineCollection(segments, cmap="viridis", norm=norm, linewidths=1.5, alpha=0.9)
+        lc.set_array(iw_np)
+        ax.add_collection(lc)
+
+        ax.scatter(x0[:, 0], x0[:, 1], c="white", edgecolors="black", s=20, marker="o", label="X0 (start)", alpha=0.9)
+        ax.scatter(x1[:, 0], x1[:, 1], c="black", s=22, marker="^", label="X1 (end)", alpha=0.9)
+
+        cbar = fig.colorbar(lc, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("IW")
+        if gamma_value is None:
+            ax.set_title(f"{title}: colored by IW")
+        else:
+            ax.set_title(f"{title}: colored by IW (gamma={gamma_value:.4f})")
+        ax.set_xlabel("Dimension 0")
+        ax.set_ylabel("Dimension 1")
+        ax.legend(loc="upper right")
+        ax.grid(alpha=0.2, linestyle="--")
+        plt.tight_layout()
+
+        wb = {f"figures/{title}": [wandb.Image(fig)]}
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
+        return wb
 
     def log_prob_per_component(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -411,20 +518,37 @@ class RingGMM(MixtureTarget):
     # Visualization and Sampling utilities inherited/adapted
     # ---------------------------------------------------------
 
-    def sample(self, num_samples: int) -> torch.Tensor:
+    def sample(self, num_samples: int | tuple[int, ...] | torch.Size) -> torch.Tensor:
         """
         Sample from the explicit categorical distribution, then add Gaussian noise.
         """
+        if isinstance(num_samples, int):
+            sample_shape = (num_samples,)
+        elif isinstance(num_samples, (tuple, torch.Size)):
+            sample_shape = tuple(int(n) for n in num_samples)
+        else:
+            raise TypeError(
+                "num_samples must be int, tuple[int, ...], or torch.Size; "
+                f"got {type(num_samples).__name__}"
+            )
+
+        if len(sample_shape) == 0:
+            sample_shape = (1,)
+        if any(n < 0 for n in sample_shape):
+            raise ValueError(f"num_samples must be non-negative, got {sample_shape}")
+
+        total_samples = math.prod(sample_shape)
+
         with torch.no_grad():
-            indices = torch.distributions.Categorical(self.component_weights).sample((num_samples,))
+            indices = torch.distributions.Categorical(self.component_weights).sample((total_samples,))
             indices = indices.to(self.locs.device)
 
             locs_sampled = self.locs[indices]
             scales_sampled = self.scales[indices]
 
             eps = torch.randn_like(locs_sampled)
-
-            return locs_sampled + eps * scales_sampled
+            samples = locs_sampled + eps * scales_sampled
+            return samples.reshape(*sample_shape, self.dim)
 
     def get_distribution_2D(self, dim1: int, dim2: int):
         locs = self.locs[:, (dim1, dim2)]
@@ -516,12 +640,18 @@ class RingGMM(MixtureTarget):
             plt.close(fig)
 
         return wb
-
-    def visualize(self, model_samples: torch.Tensor, eta_star: float = 0., model_log_prob_fn=None, show=True) -> dict:
+    
+    def visualize(
+        self,
+        model_samples: torch.Tensor,
+        eta_star: float = 0.,
+        model_log_prob_fn=None,
+        show=True,
+        title=None,
+        **kwargs,
+    ) -> dict:
         """
         Visualizes 1D and 2D marginals of the provided samples against the target density.
         """
 
         return self.visualize_2d_and_weights(model_samples, show=show)
-
-

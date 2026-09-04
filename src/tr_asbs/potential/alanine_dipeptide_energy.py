@@ -9,6 +9,7 @@ from .bgflow_energy import bgflowEnergy
 from .base_energy import BaseEnergy
 from tr_asbs.fab.target_distributions.aldp import AldpBoltzmann
 from tr_asbs.utils.md_utils import compute_all_dihedrals, compute_torsion_klds, compute_joint_W2, plot_ramachandran_AD, plot_marginal_group_AD, plot_energy_hist, to_md_traj
+from tr_asbs.utils.distribution_distance import compute_distribution_distances, w2_1d_samples
 
 # Helper functions for the ALDP target model configuration
 def make_aldp_model(config, device):
@@ -64,7 +65,12 @@ class AlanineDipeptidePotential(bgflowEnergy):
         
         repo_dir = Path(__file__).resolve().parent.parent.parent
         config = load_config(repo_dir / 'tr_asbs/fab/config.yaml')
-        config['data']['transform'] = str(repo_dir / "tr_asbs/fab/position_min_energy.pt")
+        # position_min_energy.pt (a single reference minimum-energy structure)
+        # was never present in this repo -- val_split_AD.h5 (a full REMD
+        # trajectory, see aldp.py's data_path handling for the "h5" branch) is
+        # supported directly for initializing the internal-coordinate (Z-matrix)
+        # transform and is what we actually have on disk.
+        config['data']['transform'] = str(repo_dir.parent / "data/val_split_AD.h5")
         
         self.p = make_aldp_model(config, device)
         self.p.float() # Ensure float32
@@ -115,12 +121,42 @@ class AlanineDipeptideEnergyIC(BaseEnergy):
         return ind
 
     def eval(self, samples: torch.Tensor) -> torch.Tensor:
-        # samples here are expected to be in the 'z' (internal coordinate) space
-        samples = samples.view(samples.shape[0], -1)
+        # samples here are expected to be in the 'z' (internal coordinate) space.
+        # .to(self.device) is a no-op (and stays autograd-differentiable) when
+        # samples is already on the right device -- needed because log_details
+        # passes in CPU-detached snapshots while the coordinate transform's own
+        # buffers live on self.device.
+        samples = samples.view(samples.shape[0], -1).to(self.device)
         return - self.aldp_potential._log_prob(samples)
     
     def eval_x(self, x: torch.tensor):
         return self.aldp_potential.energy_x(x)
+
+    @torch.no_grad()
+    def sample_loss(self, samples: torch.Tensor) -> torch.Tensor:
+        """Override BaseEnergy.sample_loss: `samples` (data_1, the SDE's own
+        output) is in z (internal-coordinate) space, but self.sample() returns
+        ground truth in x (Cartesian) space -- BaseEnergy's generic version
+        assumes both are in the same space and compares 60-dim vs 66-dim
+        tensors directly, which crashes. Convert samples to x-space first."""
+        gt_samples = self.sample(samples.shape[0])
+        x_samples = self.aldp_potential.z_to_x(samples.view(samples.shape[0], -1).to(self.device))
+        x_samples = x_samples.view(x_samples.shape[0], -1).detach().cpu()
+        gt_samples = gt_samples.view(gt_samples.shape[0], -1).detach().cpu()
+        return compute_distribution_distances(x_samples, gt_samples.to(x_samples.device))
+
+    @torch.no_grad()
+    def energy_dist_error(self, energies: torch.Tensor) -> torch.Tensor:
+        """Override BaseEnergy.energy_dist_error: ground-truth samples from
+        self.sample() are in x-space, but self.eval() expects z-space input --
+        use eval_x (already defined for x-space energies) instead of eval."""
+        gt_samples = self.sample(energies.shape[0])
+        gt_samples = gt_samples.view(gt_samples.shape[0], -1).detach()
+        # -eval_x to match the sign convention `energies` (passed in from
+        # log_details as `-self.eval(data_1)`) already uses.
+        gt_energies = -self.eval_x(gt_samples)
+        energy_w2 = w2_1d_samples(energies, gt_energies).detach().cpu()
+        return {"energy_W_2": energy_w2}
 
     def to(self, device):
         self.device = device
@@ -141,8 +177,13 @@ class AlanineDipeptideEnergyIC(BaseEnergy):
     
     
     def log_details(self, results: dict, prefix="", visualize=True) -> dict:
-        gen_samples_z = results["data_1"]  # coordinate z
-        gen_samples = self.aldp_potential.z_to_x(results["data_1"]) # coordinate z to x
+        # results["data_1"] is deliberately CPU-resident (log_details builds
+        # `results` with .detach().cpu() throughout, to avoid pinning GPU
+        # memory for logging), but the coordinate transform's own buffers
+        # (mean_b1 etc.) live on self.device -- z_to_x needs both on the same
+        # device.
+        gen_samples_z = results["data_1"].to(self.device)  # coordinate z
+        gen_samples = self.aldp_potential.z_to_x(gen_samples_z) # coordinate z to x
         ref_samples = self.sample(results["data_1"].shape[0]) # coordinate x
         
         logs = super().log_details(results, prefix=prefix, visualize=False)

@@ -101,14 +101,19 @@ class ZeroDriftSDE(FwdBwdSDE, ABC):
     ) -> DataType:
         """Sample X_t ~ p_{t|0, 1} (X_t | X_0, X_1)."""
         self._validate_pair(data_0, data_1)
-        
-        if time.dim() == 1:
-            time = time.unsqueeze(-1)
 
         if _is_graph_data(data_0):
             data_0_pos, data_1_pos = data_0.pos, data_1.pos
-            t_reparam = self.reparametrize_time(time[data_0.batch, None])
+            # Index the per-graph time by data_0.batch BEFORE unsqueezing --
+            # time[data_0.batch, None] on an already-(B,1)-shaped time tensor
+            # inserts an extra spurious dimension ((N,1,1) instead of (N,1)).
+            time_per_atom = time[data_0.batch]
+            if time_per_atom.dim() == 1:
+                time_per_atom = time_per_atom.unsqueeze(-1)
+            t_reparam = self.reparametrize_time(time_per_atom)
         else:
+            if time.dim() == 1:
+                time = time.unsqueeze(-1)
             data_size = data_0.shape
             data_0_pos, data_1_pos = data_0.reshape(data_size[0], -1), data_1.reshape(data_size[0], -1)
             t_reparam = self.reparametrize_time(time)
@@ -133,15 +138,19 @@ class ZeroDriftSDE(FwdBwdSDE, ABC):
     def cond_score_t0(self, time: torch.Tensor, data_0: DataType, data_t: DataType) -> torch.Tensor:
         """Compute ∇_{X_t} log p_{t|0} (X_t | X_0)."""
         self._validate_pair(data_0, data_t)
-        
-        if time.dim() == 1:
-            time = time.unsqueeze(-1)
-            
+
         if _is_graph_data(data_0):
             data_size = data_0.pos.shape
             d0, dt = data_0.pos.reshape(data_size[0], -1), data_t.pos.reshape(data_size[0], -1)
-            var = self.diffsquare_integral(time[data_0.batch, None])
+            # See sample_posterior for why data_0.batch must index time BEFORE
+            # any unsqueezing.
+            time_per_atom = time[data_0.batch]
+            if time_per_atom.dim() == 1:
+                time_per_atom = time_per_atom.unsqueeze(-1)
+            var = self.diffsquare_integral(time_per_atom)
         else:
+            if time.dim() == 1:
+                time = time.unsqueeze(-1)
             data_size = data_0.shape
             d0, dt = data_0.reshape(data_size[0], -1), data_t.reshape(data_size[0], -1)
             var = self.diffsquare_integral(time)
@@ -153,15 +162,19 @@ class ZeroDriftSDE(FwdBwdSDE, ABC):
     def cond_score_1t(self, time: torch.Tensor, data_1: DataType, data_t: DataType) -> torch.Tensor:
         """Compute ∇_{X_t} log p_{1|t} (X_1 | X_t)."""
         self._validate_pair(data_1, data_t)
-        
-        if time.dim() == 1:
-            time = time.unsqueeze(-1)
-        
+
         if _is_graph_data(data_1):
             data_size = data_1.pos.shape
             d1, dt = data_1.pos.reshape(data_size[0], -1), data_t.pos.reshape(data_size[0], -1)
-            var = self.total_variance - self.diffsquare_integral(time[data_1.batch, None])
+            # See sample_posterior for why data_1.batch must index time BEFORE
+            # any unsqueezing.
+            time_per_atom = time[data_1.batch]
+            if time_per_atom.dim() == 1:
+                time_per_atom = time_per_atom.unsqueeze(-1)
+            var = self.total_variance - self.diffsquare_integral(time_per_atom)
         else:
+            if time.dim() == 1:
+                time = time.unsqueeze(-1)
             data_size = data_1.shape
             d1, dt = data_1.reshape(data_size[0], -1), data_t.reshape(data_size[0], -1)
             var = self.total_variance - self.diffsquare_integral(time)
@@ -206,10 +219,23 @@ class EDMSDE(ZeroDriftSDE):
         self.register_buffer("rho", torch.as_tensor(rho, dtype=torch.double))
 
     def diffusion(self, time: torch.Tensor) -> torch.Tensor:
-        return (
+        # self.sigma_max/sigma_min/rho are double buffers (see __init__) for
+        # numerical precision, but a 0-dim double result combined with a
+        # 0-dim float `time` promotes to double under standard (non-"weak")
+        # tensor promotion -- and once broadcast-unsqueezed against a
+        # multi-dim float32 state elsewhere (drift()/bwd_drift()), that
+        # double is no longer scalar-exempt and upcasts the ENTIRE state,
+        # eventually reaching a float32-weight network and crashing with a
+        # dtype mismatch (only ever exercised by a flat, non-atomic
+        # integrator + EDMSDE combination -- the atomic integrators already
+        # work around this downstream via their own explicit post-step
+        # casts). Cast back to `time`'s dtype here instead, matching
+        # VESDE.diffusion()'s existing `.to(time)`, to fix it at the source.
+        diffusion = (
             (1 - time) * self.sigma_max ** (1 / self.rho)
             + time * self.sigma_min ** (1 / self.rho)
         ) ** self.rho
+        return diffusion.to(time)
 
     def diffsquare_integral(self, time: torch.Tensor | float) -> torch.DoubleTensor:
         time = torch.as_tensor(time, dtype=torch.double, device=self.sigma_max.device)
@@ -234,24 +260,34 @@ class ControlledSDE(BaseSDE):
     def drift(
         self, time: torch.Tensor, data: DataType, return_control: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        
-        diff = self.diffusion(time)  # shape: (B,)
-        
-        # --- 修正箇所: diff の次元を data に合わせる (B,) -> (B, 1) ---
-        # data が (Batch, Dim, ...) の場合に対応できるよう、次元数が合うまで後ろに1を追加
-        while diff.dim() < data.dim():
-            diff = diff.unsqueeze(-1)
-        # -----------------------------------------------------------
+
+        diff = self.diffusion(time)  # shape: () or (B,)
+
+        if _is_graph_data(data):
+            # diff is either scalar (broadcasts fine as-is) or per-graph (B,);
+            # in the latter case expand to per-atom via data.batch so it
+            # broadcasts against u_controller's per-atom (N_total_atoms, D)
+            # output, instead of data.dim() (which graph data doesn't have).
+            if diff.dim() > 0:
+                diff = diff[data.batch]
+            while diff.dim() < data.pos.dim():
+                diff = diff.unsqueeze(-1)
+        else:
+            # --- 修正箇所: diff の次元を data に合わせる (B,) -> (B, 1) ---
+            # data が (Batch, Dim, ...) の場合に対応できるよう、次元数が合うまで後ろに1を追加
+            while diff.dim() < data.dim():
+                diff = diff.unsqueeze(-1)
+            # -----------------------------------------------------------
 
         # これで diff: (1000, 1), u_controller: (1000, 2) となり
         # Broadcasting によって (1000, 2) として計算されます
         control_term = diff * self.u_controller(time, data)
-        
+
         base_drift = self.base_sde.drift(time, data)
-        
+
         # ここも diff (1000, 1) * control_term (1000, 2) なのでOK
         drift = base_drift + diff * control_term
-        
+
         if return_control:
             return drift, control_term
         return drift
@@ -280,13 +316,23 @@ class ControlledFBSDE(ControlledSDE, FwdBwdSDE):
     def bwd_drift(
         self, time: torch.Tensor, data: DataType, return_control: bool = False
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        
+
         diff = self.diffusion(time)
+
+        if _is_graph_data(data):
+            # See ControlledSDE.drift for why graph data needs explicit
+            # per-graph -> per-atom expansion instead of relying on
+            # unsqueeze-based broadcasting.
+            if diff.dim() > 0:
+                diff = diff[data.batch]
+            while diff.dim() < data.pos.dim():
+                diff = diff.unsqueeze(-1)
+
         control_term = diff * self.h_controller(time, data)
         base_drift = self.base_sde.bwd_drift(time, data)
-        
+
         drift = base_drift + diff * control_term
-        
+
         if return_control:
             return drift, control_term
         return drift

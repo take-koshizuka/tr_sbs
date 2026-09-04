@@ -14,7 +14,8 @@ potential:
   _target_: tr_asbs.potential.lennardjones_energy.LennardJonesEnergy
   n_particles: 13
   spatial_dim: 3
-  ref_samples_path: "./data/test_split_LJ13-1000_quenched.npy"
+  ref_samples_path: "./data/test_split_LJ13-1000.npy"
+  energy_clip: 10000.0
 
 ################################################################################
 # Settings for Gamma
@@ -22,7 +23,7 @@ potential:
 gamma: 1.0
 gamma_schedule: trust_region
 trust_region_bound: 0.3
-iw_clip_value: 1.
+iw_clip_value: 5.0
 
 ################################################################################
 # Training settings

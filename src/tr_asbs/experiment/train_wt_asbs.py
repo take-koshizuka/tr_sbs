@@ -4,17 +4,22 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
 from pathlib import Path
 
 import ase.io
 import hydra
+import mdtraj as md
 import torch
+import wandb
 from lightning.fabric import seed_everything
 from lightning.pytorch.utilities import rank_zero_warn
 from omegaconf import DictConfig
 from torch.utils.data import DataLoader, RandomSampler
 from tqdm import tqdm
 
+from tr_asbs.eval.calculate_torsion_metrics import calculate_torsion_metrics
+from tr_asbs.eval.eval_utils import make_ramachandran_figure, plot_marginal_group_AD
 from tr_asbs.potential.base_potential import SumPotential
 from tr_asbs.potential.metadynamics import WellTemperedMetadynamicsBias
 from tr_asbs.process.sde import ControlledSDE
@@ -113,6 +118,35 @@ class ASBSModule:
                 if isinstance(pot, WellTemperedMetadynamicsBias):
                     self.use_metadynamics = True
                     self.metadynamics_bias = pot
+
+        self.topology = None
+        self.eval_traj = None
+        self._load_eval_traj()
+
+    def _load_eval_traj(self) -> None:
+        """Load a reference trajectory for torsion-metric/Ramachandran
+        evaluation, logged alongside save_samples in populate_buffer. See
+        GammaASBSAtomicModule._load_eval_traj (train_gamma_asbs_iw_ala2.py)
+        for the same pattern used by the gamma trainer.
+        """
+        topology_path = getattr(self.cfg, "topology_pdb_file", None)
+        md_eval_pdb_file = getattr(self.cfg, "md_eval_pdb_file", None)
+
+        if topology_path is not None and os.path.exists(topology_path):
+            try:
+                self.topology = md.load_topology(topology_path)
+            except Exception as exc:
+                rank_zero_warn(f"Failed to load topology_pdb_file '{topology_path}': {exc}")
+                self.topology = None
+
+        if md_eval_pdb_file is not None and os.path.exists(md_eval_pdb_file):
+            try:
+                if self.topology is not None:
+                    self.eval_traj = md.load(md_eval_pdb_file, top=topology_path)
+                else:
+                    self.eval_traj = md.load(md_eval_pdb_file)
+            except Exception as exc:
+                rank_zero_warn(f"Could not load md_eval_pdb_file '{md_eval_pdb_file}': {exc}")
 
     ############################################################################
     # Training loop structure
@@ -227,10 +261,6 @@ class ASBSModule:
                 self.fabric.log(
                     "train/temperature", data_1.temperature[0], step=self.global_step
                 )
-                # Save samples
-                if self.fabric.global_rank == 0:
-                    if self.current_epoch % self.cfg.save_sample_interval_epoch == 0:
-                        self.save_samples(data_1)
             # Log buffer max grad norm
             if self.cfg.log_buffer_grad_norm:
                 median_grad_norm = torch.cat(
@@ -244,6 +274,20 @@ class ASBSModule:
                     median_grad_norm,
                     step=self.global_step,
                 )
+
+        # Save samples / torsion-metric + Ramachandran evaluation -- runs on
+        # a plain epoch-count cadence regardless of curriculum stage
+        # (adjoint_matching or corrector_matching), unlike the buffer-energy
+        # logging above which is adjoint_matching-only. Both save_samples
+        # and _log_torsion_and_ramachandran only need a valid rollout
+        # (data_1, computed unconditionally in the loop above) or draw their
+        # own independent rollout, so neither depends on which task this
+        # epoch belongs to.
+        if self.fabric.global_rank == 0:
+            if self.current_epoch % self.cfg.save_sample_interval_epoch == 0:
+                self.save_samples(data_1)
+                self._log_torsion_and_ramachandran()
+
         self.fabric.log(
             f"train/{current_task.name}_buffer_size", len(buffer), step=self.global_step
         )
@@ -269,6 +313,57 @@ class ASBSModule:
             else:  # default to XYZ format
                 filename = sample_directory / f"epoch_{self.current_epoch:04d}.xyz"
                 ase.io.write(str(filename), data.to_ase())
+
+    @torch.no_grad()
+    def _log_torsion_and_ramachandran(self) -> None:
+        """Torsion-metric (JSD/free-energy RMSE vs. a reference trajectory)
+        and marginal-torsion/Ramachandran plot logging -- see
+        GammaASBSAtomicModule.log_details (train_gamma_asbs_iw_ala2.py) for
+        the same evaluation used by the gamma trainer.
+
+        Draws its OWN dedicated eval_samples-sized rollout rather than
+        reusing populate_buffer's inference_batch_size batch (64, vs.
+        eval_samples=2000) -- otherwise this trainer's marginal/Ramachandran
+        plots would be built from ~30x fewer frames than the gamma trainer's,
+        making the two not a fair visual comparison.
+        """
+        if self.eval_traj is None or self.topology is None:
+            return
+        try:
+            eval_samples = getattr(self.cfg, "eval_samples", self.cfg.inference_batch_size)
+            controller_training_state = self.controller.training
+            self.controller.eval()
+            data_0 = self.source.sample((eval_samples,))
+            data = self.integrator.run(
+                initial_data=data_0,
+                center_every_step=self.cfg.mean_free,
+                zero_last_step_noise=False,
+                return_trajectory=False,
+                progress_bar=self.fabric.global_rank == 0 and self.cfg.progress_bar,
+            )
+            self.controller.train(controller_training_state)
+            xyz = data.pos.reshape(data.num_graphs, -1, 3).detach().cpu().numpy() / 10.0
+            traj = md.Trajectory(xyz, self.topology)
+            kld_logs = plot_marginal_group_AD(gen_traj=traj, ref_traj=self.eval_traj)
+            if not self.cfg.visualize and "Vis/marginal" in kld_logs:
+                kld_logs.pop("Vis/marginal")
+            metrics = dict(kld_logs)
+            metrics.update(
+                calculate_torsion_metrics(
+                    self.eval_traj, traj,
+                    temp=float(getattr(self.cfg, "temperature", 300.0)),
+                )
+            )
+            if self.cfg.visualize:
+                rama_fig = make_ramachandran_figure(traj)
+                if rama_fig is not None:
+                    metrics["Vis/ramachandran"] = wandb.Image(rama_fig)
+                    import matplotlib.pyplot as plt
+
+                    plt.close(rama_fig)
+            self.fabric.log_dict(metrics, step=self.global_step)
+        except Exception as exc:
+            rank_zero_warn(f"Torsion/Ramachandran logging skipped due to evaluation error: {exc}")
 
     def create_dataloader(self, current_task) -> DataLoader:
         # Select the appropriate dataset (buffer) based on the current task

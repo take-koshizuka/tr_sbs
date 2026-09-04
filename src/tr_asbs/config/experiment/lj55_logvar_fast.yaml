@@ -1,0 +1,145 @@
+# @package _global_
+#
+# LJ-55, log-variance FC loss, "fast" variant of lj55_logvar.yaml: same shrunk
+# EGNN (3 layers, 64 hidden, no attention -- already required just to fit at
+# all). bf16 autocast (logvar_amp_dtype) was tried and REMOVED: on the LJ-13
+# fast config it caused RN[h|u]/ess to climb to ~0.99 (looks healthy) while
+# ground-truth metrics (Eq-EMD2, energy_W_2) showed the controller/corrector
+# had actually degenerated together into unphysical garbage -- see
+# lj13_logvar_fast.yaml for the full writeup. Same risk applies here, so bf16
+# is dropped in favor of plain fp32. Batch size re-measured without bf16
+# (scratch_egnn_mem_probe_lj55_fixed.py): batch=12 needs ~46.8GB (no headroom
+# at all -- unsafe), batch=8 needs ~31.2GB (safe margin), so this stays at the
+# original 8 rather than the bf16-enabled 12.
+
+name: lj55_egnn_logvar_fast_tr_asbs
+fabric:
+  loggers:
+    tags: [lj55, egnn, log_variance, fast]
+
+seed: 0
+compile: false
+
+################################################################################
+# Potentials
+################################################################################
+potential:
+  _target_: tr_asbs.potential.lennardjones_energy.LennardJonesEnergy
+  n_particles: 55
+  spatial_dim: 3
+  ref_samples_path: "./data/test_split_LJ55-1000-part1.npy"
+  energy_clip: 10000.0 # same fix as LJ-13 -- see lj13_logvar_fast.yaml for the writeup
+
+################################################################################
+# Settings for Gamma
+################################################################################
+gamma: 1.0
+gamma_schedule: trust_region
+trust_region_bound: 0.2
+iw_clip_value: 10
+
+# Use the importance-weight-free log-variance FC loss instead of cross-entropy.
+fc_loss_mode: log_variance
+
+################################################################################
+# Training settings
+################################################################################
+max_outer_loops: 2000 # effectively unbounded given the SLURM time limit; run until killed
+adjoint_matching_epochs: 300
+corrector_matching_epochs: 20
+steps_per_epoch: 300
+train_batch_size: 8
+inference_batch_size: 1000
+num_samples_for_dual_loss: [100, 10]
+
+################################################################################
+# Logging
+################################################################################
+log_detail_interval_epoch: 50
+monitor_values: ["loss/Eq-EMD2", "loss/neg_avg_energy"]
+
+################################################################################
+# Models
+################################################################################
+controller:
+  _target_: tr_asbs.model.egnn.EGNN_dynamics
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  n_layers: 3
+  hidden_nf: 64
+  attention: false
+  agg: sum
+  compile: ${compile}
+  clip_norm: 100.0
+
+corrector:
+  _target_: tr_asbs.model.egnn.EGNN_dynamics
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  n_layers: 3
+  hidden_nf: 64
+  attention: false
+  agg: sum
+  compile: ${compile}
+  clip_norm: 100.0
+
+################################################################################
+# Optimization
+################################################################################
+controller_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+corrector_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+gradient_clip_val: 100.0
+
+################################################################################
+# Buffers
+################################################################################
+adjoint_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 10000
+
+corrector_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 10000
+
+initial_buffer_samples: 1000
+buffer_samples_per_epoch: 1000
+log_buffer_energy: true
+log_buffer_grad_norm: true
+
+################################################################################
+# Process and integration
+################################################################################
+source:
+  _target_: tr_asbs.process.source.MeanFreePrior
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  scale: 1.0
+
+base_sde:
+  _target_: tr_asbs.process.sde.VESDE
+  sigma_min: 0.5
+  sigma_max: 2.0
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 200
+    rescale_t: null
+
+################################################################################
+# Terminal cost
+################################################################################
+terminal_cost:
+  _target_: tr_asbs.process.terminal_cost.ASBSTerminalCost
+  grad_clip_val: 100.0

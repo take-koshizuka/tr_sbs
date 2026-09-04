@@ -1,0 +1,142 @@
+# @package _global_
+#
+# LJ-13 ASBS baseline (for train_asbs.py -- Eq. 14/15 in the paper, no
+# importance weighting, no trust region, plain fixed-point IPF iteration),
+# with architecture SHRUNK to match the other 4 ablation variants
+# (lj13_ce_fast.yaml / lj13_logvar_fast.yaml: 3-layer/64-hidden/no-attention
+# EGNN) instead of lj13.yaml's original full-size (5-layer/128-hidden/
+# attention) network -- otherwise this ablation would confound network
+# capacity with the IW/TR effects actually being studied. Same energy_clip/
+# iw_clip_value fixes as lj13.yaml.
+# @package _global_
+name: lj13_asbs_baseline_mlp
+fabric:
+  loggers:
+    tags: [lj13]
+
+seed: 0
+compile: false
+
+################################################################################
+# Potentials
+################################################################################
+potential:
+  _target_: tr_asbs.potential.lennardjones_energy.LennardJonesEnergy
+  n_particles: 13
+  spatial_dim: 3
+  ref_samples_path: "./data/test_split_LJ13-1000.npy"
+  energy_clip: 10000.0
+
+################################################################################
+# Settings for Gamma
+################################################################################
+gamma: 1.0
+gamma_schedule: trust_region
+trust_region_bound: 0.3
+iw_clip_value: 5.0
+
+################################################################################
+# Training settings
+################################################################################
+max_outer_loops: 50
+adjoint_matching_epochs: 200
+corrector_matching_epochs: 50
+steps_per_epoch: 100
+train_batch_size: 200
+inference_batch_size: 1000
+num_samples_for_dual_loss: [500, 20]
+
+################################################################################
+# Logging
+################################################################################
+log_detail_interval_epoch: 250
+monitor_values: ["loss/Eq-EMD2", "loss/neg_avg_energy"]
+
+################################################################################
+# Models
+################################################################################
+controller:
+  _target_: tr_asbs.model.mlp.FlattenReshapeWrapper
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  base_model:
+    _target_: tr_asbs.model.mlp.FourierMLP
+    dim: 39 # 13 particles * 3 spatial dims
+    num_layers: 6
+    channels: 256
+    clip_norm: 100.0
+
+corrector:
+  _target_: tr_asbs.model.mlp.FlattenReshapeWrapper
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  base_model:
+    _target_: tr_asbs.model.mlp.FourierMLP
+    dim: 39
+    num_layers: 6
+    channels: 256
+    clip_norm: 100.0
+
+################################################################################
+# Optimization
+################################################################################
+controller_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+corrector_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+gradient_clip_val: 100.0
+loss_1_weight: 1.0
+
+################################################################################
+# Buffers
+################################################################################
+adjoint_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+corrector_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+initial_buffer_samples: 1000
+buffer_samples_per_epoch: 1000
+log_buffer_energy: true
+log_buffer_grad_norm: true
+
+################################################################################
+# Process and integration
+################################################################################
+source:
+  _target_: tr_asbs.process.source.MeanFreePrior
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  scale: 2.0
+
+base_sde:
+  _target_: tr_asbs.process.sde.VESDE
+  sigma_min: 0.001
+  sigma_max: 0.5
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 200
+    rescale_t: null
+
+################################################################################
+# Terminal cost
+################################################################################
+terminal_cost:
+  _target_: tr_asbs.process.terminal_cost.ASBSTerminalCost
+  grad_clip_val: 100.0
+
+E_max: 10000

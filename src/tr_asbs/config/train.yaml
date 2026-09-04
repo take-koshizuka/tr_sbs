@@ -32,6 +32,22 @@ ema_decay: null
 ema_start_step: 0
 visualize: false
 
+# Corrector-side trust-region damping (opt-in; "none" preserves existing
+# behavior exactly). See train_gamma_asbs_iw.py's GammaASBSModule.__init__ and
+# compute_corrector_gamma() for what "reuse_u_gamma"/"independent" do.
+corrector_gamma_mode: none
+corrector_trust_region_bound: null
+adjoint_buffer_duplicates: 1
+checkpoint_group_id: null
+per_time_anchor_target: false
+gamma_floor: 0.0
+
+# Opt-in (default off, preserving existing behavior exactly): clear the
+# adjoint buffer at the start of every outer loop so it never mixes samples
+# from two different (u, h) snapshots (see train_gamma_asbs_iw.py's
+# inner_loop_u for the exact rationale).
+clear_adjoint_buffer_per_outer_loop: false
+
 # backward loss defaults (used by train_general_asbs_iw.py)
 backward_loss_mode: score_matching
 backward_loss_terms: [score_matching]
@@ -57,8 +73,5 @@ fabric:
     save_dir: ${hydra:run.dir}
     group: null
   
-#wandb_host: https://wandb.zib.de/
-#wandb_key: local-b695da14758c0a61e42c00468ef41501ade574b4
 wandb_host: https://api.wandb.ai
-wandb_key: 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
 wandb_mode: online

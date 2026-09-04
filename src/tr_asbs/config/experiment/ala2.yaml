@@ -14,14 +14,36 @@ composition: HCH2CONHCHCH3CONHCH3
 num_atoms: 22
 mean_free: true
 
+# Reference trajectory for torsion-metric/Ramachandran evaluation (see
+# GammaASBSAtomicModule._load_eval_traj / ASBSModule._load_eval_traj).
+#
+# NOT md_data/ala2/ala2_0.1ns.pdb: that file (see
+# md_data/ala2/mdrun_pretrain.py in the reference repo) is only 100ps/1000
+# frames of OpenMM simulation, explicitly generated as bridge-matching
+# PRETRAINING warm-start data (PreGeneratedAtomsSource), not a converged
+# evaluation reference -- confirmed by comparing its marginal torsion
+# histograms against ALDP's own (much larger) reference: phi/psi/gamma2/
+# gamma3 roughly match (just noisier), but gamma1 is qualitatively wrong
+# (a sharp two-state spike vs ALDP's smooth 4-mode distribution), i.e. that
+# torsion never transitioned states in the short 0.1ns window. The reference
+# repo's OWN evaluation reference is a different, separately-generated file
+# (ala2_300K_val.npy) that was never committed to git (gitignored) and isn't
+# available here. Since it's the same molecule/ensemble, val_split_AD.h5 --
+# ALDP's own 1M-frame, well-converged 300K reference trajectory, confirmed
+# to already share the identical 22-atom topology/ordering -- is reused
+# directly instead (mdtraj reads its embedded topology; no z_to_x internal-
+# coordinate transform needed, since this file is already stored in
+# Cartesian coordinates like ala2_0.1ns.pdb was).
+md_eval_pdb_file: ./data/val_split_AD.h5
+
 ################################################################################
 # Models
 ################################################################################
 
 controller:
-  _target_: wt_asbs.model.controller.ClippedModel
+  _target_: tr_asbs.model.controller.ClippedModel
   base_model:
-    _target_: wt_asbs.model.painn_fc.PaiNN
+    _target_: tr_asbs.model.painn_fc.PaiNN
     num_features: 128
     num_radial_basis: 64
     num_layers: 4
@@ -35,9 +57,9 @@ controller:
   clip_value: null
 
 corrector:
-  _target_: wt_asbs.model.controller.ClippedModel
+  _target_: tr_asbs.model.controller.ClippedModel
   base_model:
-    _target_: wt_asbs.model.painn_fc.PaiNN
+    _target_: tr_asbs.model.painn_fc.PaiNN
     num_features: 128
     num_radial_basis: 64
     num_layers: 3
@@ -78,12 +100,12 @@ ema_start_step: 0
 ################################################################################
 
 adjoint_buffer:
-  _target_: wt_asbs.data.buffer.ThermoAtomicDataBuffer
+  _target_: tr_asbs.data.buffer.ThermoAtomicDataBuffer
   max_size: 2048
   filter_nan: true
 
 corrector_buffer:
-  _target_: wt_asbs.data.buffer.ThermoAtomicDataBuffer
+  _target_: tr_asbs.data.buffer.ThermoAtomicDataBuffer
   max_size: 2048
   filter_nan: true
 
@@ -97,7 +119,7 @@ log_buffer_grad_norm: true
 ################################################################################
 
 source:
-  _target_: wt_asbs.process.source.GaussianSource
+  _target_: tr_asbs.process.source.GaussianSource
   pbc: ${pbc}
   cell: ${cell}
   composition: ${composition}
@@ -105,21 +127,22 @@ source:
   center: ${mean_free}
 
 pretrain_target:
-  _target_: wt_asbs.process.source.PreGeneratedAtomsSource
+  _target_: tr_asbs.process.source.PreGeneratedAtomsSource
   atoms_file: md_data/ala2/ala2_0.1ns.pdb
 
 bridge_matching_max_time: 0.99  # time cutoff for numerically stable score computation
 
 base_sde:
-  _target_: wt_asbs.process.sde.EDMSDE
+  _target_: tr_asbs.process.sde.EDMSDE
   sigma_min: 0.001
   sigma_max: 6.0
   rho: 3.0
+  is_mean_free: ${mean_free}
 
 integrator:
-  _target_: wt_asbs.process.integrator.EulerMaruyamaIntegrator
+  _target_: tr_asbs.process.integrator.AtomicEulerMaruyamaIntegrator
   timesteps:
-    _target_: wt_asbs.process.integrator.get_timesteps
+    _target_: tr_asbs.process.integrator.get_timesteps
     t0: 0.0
     t1: 1.0
     steps: 250
@@ -130,9 +153,9 @@ integrator:
 ################################################################################
 
 potential:
-  _target_: wt_asbs.potential.base.SumPotential
+  _target_: tr_asbs.potential.base.SumPotential
   potentials:
-    - _target_: wt_asbs.potential.openmm.OpenMMPotential
+    - _target_: tr_asbs.potential.openmm.OpenMMPotential
       system:
         _target_: openmmtools.testsystems.AlanineDipeptideImplicit
         constraints: null  # should not use hbonds constraint
@@ -142,7 +165,7 @@ potential:
     - ${chirality_restraint_2}
 
 metadynamics:
-  _target_: wt_asbs.potential.metadynamics.WellTemperedMetadynamicsBias
+  _target_: tr_asbs.potential.metadynamics.WellTemperedMetadynamicsBias
   cv: ${cv}
   height: 0.0005
   sigma: [0.2, 0.2]
@@ -155,27 +178,27 @@ metadynamics:
   skip_initial_epochs: 50
 
 cv:
-  _target_: wt_asbs.potential.metadynamics.collective_variable.TorsionCV
+  _target_: tr_asbs.potential.metadynamics.collective_variable.TorsionCV
   indices: [[4, 6, 8, 14], [6, 8, 14, 16]]
 
 chirality_restraint_1:  # Restraint for L-amino acid (CA, N, C, CB improper torsion)
-  _target_: wt_asbs.potential.metadynamics.restraint.ChiralityRestraint
+  _target_: tr_asbs.potential.metadynamics.restraint.ChiralityRestraint
   indices: [[8, 6, 14, 10]]
   location: 0.6154797086703873  # +35 deg
   force_constant: 25.0  # eV/rad^2
 
 chirality_restraint_2:  # Restraint for L-amino acid (CA, N, C, HA improper torsion)
-  _target_: wt_asbs.potential.metadynamics.restraint.ChiralityRestraint
+  _target_: tr_asbs.potential.metadynamics.restraint.ChiralityRestraint
   indices: [[8, 6, 14, 9]]
   location: -0.6154797086703873  # -35 deg
   force_constant: 25.0  # eV/rad^2
 
 terminal_cost:
-  _target_: wt_asbs.process.terminal_cost.ASBSTerminalCost
+  _target_: tr_asbs.process.terminal_cost.AtomicASBSTerminalCost
   grad_clip_val: 100.0
 
 annealer:
-  _target_: wt_asbs.process.annealer.TemperatureAnnealer
+  _target_: tr_asbs.process.annealer.TemperatureAnnealer
   epochs: [0, 500]
   temperatures: [300.0, 300.0]  # no annealing
 
@@ -203,27 +226,27 @@ curriculum:
 
 skip_scheduler_steps: 0
 pretrain_scheduler:
-  _target_: wt_asbs.utils.training.CosineAnnealingWithWarmupScheduler
+  _target_: tr_asbs.utils.training.CosineAnnealingWithWarmupScheduler
   curriculum:
-    _target_: wt_asbs.utils.training.TrainingCurriculum
+    _target_: tr_asbs.utils.training.TrainingCurriculum
     curriculum: ${pretrain_curriculum}
   task_name: bridge_matching
   steps_per_epoch: ${steps_per_epoch}
   warmup_epochs: 50
   eta_min: 1e-4
 controller_scheduler:
-  _target_: wt_asbs.utils.training.CosineAnnealingWithWarmupScheduler
+  _target_: tr_asbs.utils.training.CosineAnnealingWithWarmupScheduler
   curriculum:
-    _target_: wt_asbs.utils.training.TrainingCurriculum
+    _target_: tr_asbs.utils.training.TrainingCurriculum
     curriculum: ${curriculum}
   task_name: adjoint_matching
   steps_per_epoch: ${steps_per_epoch}
   warmup_epochs: ${metadynamics.skip_initial_epochs}
   eta_min: 1e-5
 corrector_scheduler:
-  _target_: wt_asbs.utils.training.CosineAnnealingWithWarmupScheduler
+  _target_: tr_asbs.utils.training.CosineAnnealingWithWarmupScheduler
   curriculum:
-    _target_: wt_asbs.utils.training.TrainingCurriculum
+    _target_: tr_asbs.utils.training.TrainingCurriculum
     curriculum: ${curriculum}
   task_name: corrector_matching
   steps_per_epoch: ${steps_per_epoch}

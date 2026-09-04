@@ -15,6 +15,7 @@ potential:
   n_particles: 55
   spatial_dim: 3
   ref_samples_path: "./data/test_split_LJ55-1000-part1.npy"
+  energy_clip: 10000.0 # same fix as LJ-13 -- see lj13_logvar_fast.yaml for the writeup
 
 
 ################################################################################

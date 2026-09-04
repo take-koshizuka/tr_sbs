@@ -124,9 +124,36 @@ class TimeEmbed(Model):
         return self.out_layer(embed_t)  # (N, dim_out)
 
 def clip(tensor: torch.Tensor, max_norm: float | None = None):
+    """Straight-through per-component clip -- see egnn.py's clip() for the
+    identical fix and full rationale (a plain torch.clip zeros the gradient
+    beyond its bounds, silently killing the training signal on the network's
+    own output exactly when a large-magnitude control is needed)."""
     if max_norm is not None:
-        tensor = tensor.clip(min=-1.0 * max_norm, max=max_norm)
+        clipped = tensor.clip(min=-1.0 * max_norm, max=max_norm)
+        tensor = tensor + (clipped - tensor).detach()
     return tensor
+
+
+class FlattenReshapeWrapper(nn.Module):
+    """
+    Wraps a flat-vector model (e.g. FourierMLP) so it can be used on particle-shaped
+    data of shape (..., n_particles, spatial_dim): flattens to (..., n_particles *
+    spatial_dim) before calling the wrapped model, and reshapes its output back to the
+    particle-shaped layout afterward. This lets a non-equivariant flat MLP see the full
+    joint configuration (all particles at once) rather than being applied per-particle.
+    """
+
+    def __init__(self, base_model: nn.Module, n_particles: int, spatial_dim: int):
+        super().__init__()
+        self.base_model = base_model
+        self.n_particles = n_particles
+        self.spatial_dim = spatial_dim
+
+    def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        prefix = x.shape[:-2]
+        x_flat = x.reshape(*prefix, self.n_particles * self.spatial_dim)
+        out_flat = self.base_model(t, x_flat)
+        return out_flat.reshape(*prefix, self.n_particles, self.spatial_dim)
 
 
 class FourierMLP(Model):

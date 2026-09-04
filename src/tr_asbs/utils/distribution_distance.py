@@ -323,7 +323,17 @@ def eot(x0, x1):
         superimposed = torch.matmul(reordered, R)
         M.append(torch.cdist(x0[i].reshape(1, -1), superimposed.reshape(len(x1), -1)))
     M = torch.stack(M).squeeze()
-    return pot.emd2(M=M, a=torch.ones(len(x0)) / len(x0), b=torch.ones(len(x1)) / len(x1))
+    # Square the cost before the exact OT solve, then sqrt the result -- this
+    # is what turns the OT cost into an actual Wasserstein-2 distance (W2 :=
+    # sqrt(min E[||X-Y||^2])), matching the reference this alignment logic
+    # was ported from (facebookresearch/adjoint_samplers, evaluator.py's
+    # eq_w2: `pot.emd2(M=M**2, a=a, b=b)**0.5`). Without this, `pot.emd2`
+    # returns the OT cost under the RAW (unsquared) distance matrix M --
+    # i.e. an order-1 Wasserstein/EMD on the permutation+rotation-aligned
+    # point clouds, not the order-2 quantity "Eq-EMD2" is named for and that
+    # Table 2 of that paper reports as "W2".
+    cost = pot.emd2(M=M**2, a=torch.ones(len(x0)) / len(x0), b=torch.ones(len(x1)) / len(x1))
+    return cost ** 0.5
 
 def _find_rigid_alignment(A, B):
     """

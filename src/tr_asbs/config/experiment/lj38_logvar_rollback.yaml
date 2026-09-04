@@ -1,0 +1,165 @@
+# @package _global_
+#
+# LJ-38, identical to lj38_logvar.yaml (the yh5mnga0 setup: EGNN, shrunk
+# 3-layer/64-hidden/no-attention, fixed trust_region_bound=0.2, log-variance FC
+# loss) EXCEPT weight-checkpoint rollback is enabled. yh5mnga0 climbed to a
+# healthy RN[h|u]/ess=0.427 by epoch ~1650, then collapsed to ~2e-5 at epoch
+# 1775 (triggered by a routine, small gamma step-up) and never recovered
+# through epoch 2625+. adapt_trust_region_bound only ever adjusts epsilon going
+# forward, so it can't undo that -- this instead snapshots controller+corrector
+# (+ optimizer states) whenever ESS looks healthy, and restores the last
+# snapshot the moment ESS collapses, directly undoing the bad gradient step
+# rather than just preventing future ones.
+
+name: lj38_egnn_logvar_rollback_tr_asbs
+fabric:
+  loggers:
+    tags: [lj38, egnn, eval25, log_variance, weight_rollback]
+
+seed: 0
+compile: false
+
+################################################################################
+# Potentials
+################################################################################
+potential:
+  _target_: tr_asbs.potential.lennardjones_energy.LennardJonesEnergyNoGT
+  n_particles: 38
+  spatial_dim: 3
+  energy_clip: 10000.0 # clip each pairwise LJ term to avoid 1/r^12 blowups from near-overlaps
+
+################################################################################
+# Settings for Gamma
+################################################################################
+gamma: 1.0
+gamma_schedule: trust_region
+trust_region_bound: 0.2
+iw_clip_value: 5.0
+
+# Use the importance-weight-free log-variance FC loss instead of cross-entropy.
+fc_loss_mode: log_variance
+
+# Weight-checkpoint rollback: restore controller+corrector to the last
+# ESS-healthy snapshot the moment RN[h|u]/ess drops below threshold. 1e-3 is
+# comfortably below every observed "healthy" ESS reading (>=0.008 even early
+# in training) and comfortably above the collapsed floor (~2e-5). patience=1
+# because collapses on LJ-38 have never self-corrected, so there's no reason
+# to wait for confirmation before rolling back.
+weight_rollback_enabled: true
+weight_rollback_ess_threshold: 1e-3
+weight_rollback_patience: 1
+
+################################################################################
+# Training settings
+################################################################################
+max_outer_loops: 30
+adjoint_matching_epochs: 200
+corrector_matching_epochs: 50
+steps_per_epoch: 100
+# Reduced from lj38_logvar.yaml's 150. Root cause (found via py-spy live stack
+# trace on the actual running yh5mnga0 process, PID inspection showing it
+# executing a function named interval_log_ratio that no longer exists on
+# disk): yh5mnga0 was trained under an EARLIER, coarser two-interval log-
+# variance approximation, silently superseded in-place by the current exact
+# dense per-step rewrite later in the same session -- the old code was never
+# committed (repo policy: no commits without asking) and only survives inside
+# that already-running process's memory, so it can't be recovered to match
+# exactly. The dense version is more correct but costs ~9.3MB/row (measured,
+# scratch_egnn_mem_probe_lj38_fixed.py) x batch_size*integrator_steps rows --
+# at the original batch=150 that's ~140GB, hence the repeated OOMs. Shrunk to
+# 20 (2000 rows, ~18.6GB measured), which fits with real headroom.
+train_batch_size: 20
+inference_batch_size: 500
+num_samples_for_dual_loss: [500, 20]
+
+################################################################################
+# Logging
+################################################################################
+log_detail_interval_epoch: 25
+monitor_values: ["loss/neg_avg_energy"]
+
+################################################################################
+# Models
+################################################################################
+controller:
+  _target_: tr_asbs.model.egnn.EGNN_dynamics
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  n_layers: 3
+  hidden_nf: 64
+  attention: false
+  agg: sum
+  compile: ${compile}
+  clip_norm: 100.0
+
+corrector:
+  _target_: tr_asbs.model.egnn.EGNN_dynamics
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  n_layers: 3
+  hidden_nf: 64
+  attention: false
+  agg: sum
+  compile: ${compile}
+  clip_norm: 100.0
+
+################################################################################
+# Optimization
+################################################################################
+controller_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+corrector_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+gradient_clip_val: 100.0
+
+################################################################################
+# Buffers
+################################################################################
+adjoint_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+corrector_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+initial_buffer_samples: 500
+buffer_samples_per_epoch: 500
+log_buffer_energy: true
+log_buffer_grad_norm: true
+
+################################################################################
+# Process and integration
+################################################################################
+source:
+  _target_: tr_asbs.process.source.MeanFreePrior
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  scale: 1.5
+
+base_sde:
+  _target_: tr_asbs.process.sde.VESDE
+  sigma_min: 0.1
+  sigma_max: 1.0
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 100
+    rescale_t: null
+
+################################################################################
+# Terminal cost
+################################################################################
+terminal_cost:
+  _target_: tr_asbs.process.terminal_cost.ASBSTerminalCost
+  grad_clip_val: 100.0

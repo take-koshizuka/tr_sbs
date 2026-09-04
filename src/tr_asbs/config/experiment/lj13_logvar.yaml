@@ -1,0 +1,159 @@
+# @package _global_
+#
+# LJ-13, identical to lj13.yaml (EGNN, ground-truth ref samples, Eq-EMD2 metric)
+# EXCEPT trust_region_bound is fixed to 0.2 (matching the LJ-38 run that showed
+# healthy, steadily-improving gamma/ESS/energy) and the u-controller uses the
+# log-variance (VarGrad-style) FC loss instead of cross-entropy -- see
+# adjoint_matching_log_variance_step in train_gamma_asbs_iw.py.
+#
+# energy_clip and iw_clip_value: see lj13_logvar_fast.yaml for the full
+# writeup. Auditing why global_step lagged epoch*steps_per_epoch so badly
+# (azya1pwz, this exact config: epoch 25->825 advanced global_step by only
+# 5135 vs a nominal 80,000, ~93.6% of computed batches silently discarded)
+# traced to training_step()'s skip-on-non-finite-loss/gradient logic being
+# triggered by unclipped near-overlapping pairs (LennardJonesEnergy didn't
+# support energy_clip until now) and iw_clip_value=1.0 (a stray value in the
+# original lj13.yaml that caps every importance weight at the mean).
+
+name: lj13_egnn_logvar_tr_asbs
+fabric:
+  loggers:
+    tags: [lj13, egnn, log_variance]
+
+seed: 0
+compile: false
+
+################################################################################
+# Potentials
+################################################################################
+potential:
+  _target_: tr_asbs.potential.lennardjones_energy.LennardJonesEnergy
+  n_particles: 13
+  spatial_dim: 3
+  ref_samples_path: "./data/test_split_LJ13-1000.npy"
+  energy_clip: 10000.0
+
+################################################################################
+# Settings for Gamma
+################################################################################
+gamma: 1.0
+gamma_schedule: trust_region
+trust_region_bound: 0.2
+iw_clip_value: 5.0
+
+# Use the importance-weight-free log-variance FC loss instead of cross-entropy.
+fc_loss_mode: log_variance
+
+################################################################################
+# Training settings
+################################################################################
+max_outer_loops: 2000 # effectively unbounded given the SLURM time limit; run until killed
+adjoint_matching_epochs: 200
+corrector_matching_epochs: 50
+steps_per_epoch: 100
+# The log-variance loss flattens (batch, T, ...) into one batched EGNN forward
+# pass of batch_size*integrator_steps rows -- with the base lj13.yaml
+# batch_size=200 and 200 integrator steps that's 40,000 rows through the
+# full-size (5-layer, 128-hidden) EGNN, which OOMs a 44GB A40. Measured directly
+# (scratch_egnn_mem_probe.py): memory scales linearly at ~3.83MB/row, so 40,000
+# rows needs ~153GB. batch_size=24 (4800 rows, ~18GB for this forward pass alone)
+# leaves ample headroom for the corrector network, optimizer states, and eval
+# sampling. Shrinking the minibatch (a pure SGD hyperparameter, not part of the
+# architecture/TR-bound setup) is the fix; integrator steps and EGNN size are
+# left untouched.
+train_batch_size: 24
+inference_batch_size: 1000
+num_samples_for_dual_loss: [500, 20]
+
+################################################################################
+# Logging
+################################################################################
+log_detail_interval_epoch: 25
+monitor_values: ["loss/Eq-EMD2", "loss/neg_avg_energy"]
+
+################################################################################
+# Models
+################################################################################
+controller:
+  _target_: tr_asbs.model.egnn.EGNN_dynamics
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  n_layers: 5
+  hidden_nf: 128
+  agg: sum
+  compile: ${compile}
+  clip_norm: 100.0
+
+corrector:
+  _target_: tr_asbs.model.egnn.EGNN_dynamics
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  n_layers: 5
+  hidden_nf: 128
+  agg: sum
+  compile: ${compile}
+  clip_norm: 100.0
+
+################################################################################
+# Optimization
+################################################################################
+controller_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+corrector_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+gradient_clip_val: 100.0
+loss_1_weight: 1.0
+
+################################################################################
+# Buffers
+################################################################################
+adjoint_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+corrector_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+initial_buffer_samples: 1000
+buffer_samples_per_epoch: 1000
+log_buffer_energy: true
+log_buffer_grad_norm: true
+
+################################################################################
+# Process and integration
+################################################################################
+source:
+  _target_: tr_asbs.process.source.MeanFreePrior
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  scale: 2.0
+
+base_sde:
+  _target_: tr_asbs.process.sde.VESDE
+  sigma_min: 0.001
+  sigma_max: 0.5
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 200
+    rescale_t: null
+
+################################################################################
+# Terminal cost
+################################################################################
+terminal_cost:
+  _target_: tr_asbs.process.terminal_cost.ASBSTerminalCost
+  grad_clip_val: 100.0
+
+E_max: 10000

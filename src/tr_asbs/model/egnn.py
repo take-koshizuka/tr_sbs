@@ -11,8 +11,20 @@ from tr_asbs.utils.geometry import subtract_mean_batch, subtract_com_vector
 ############################################################################################
 
 def clip(tensor: torch.Tensor, max_norm: float | None = None):
+    """Straight-through per-component clip: forward value is bounded to
+    [-max_norm, max_norm] (numerical safety), but gradient flows as if
+    unclipped. A plain torch.clip has exactly zero gradient beyond its
+    bounds -- since this is applied to the network's own output (the control
+    itself, e.g. EGNN_dynamics.forward's `vel`), a hard clip would silently
+    give zero training signal on the network's weights whenever the target
+    the loss is regressing toward requires an output magnitude beyond
+    max_norm in some component -- exactly the regime (e.g. a strong,
+    correctly-large repulsive push for a near-overlapping configuration)
+    where a correct, informative gradient matters most. See the identical
+    fix + rationale in lennardjones_energy.py's _energy()."""
     if max_norm is not None:
-        tensor = tensor.clip(min=-1.0 * max_norm, max=max_norm)
+        clipped = tensor.clip(min=-1.0 * max_norm, max=max_norm)
+        tensor = tensor + (clipped - tensor).detach()
     return tensor
 
 class EGNN_dynamics(nn.Module):

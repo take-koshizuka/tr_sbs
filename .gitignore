@@ -21,6 +21,7 @@ dist/
 
 # Virtual environments and local environment variables
 .venv/
+.venv
 venv/
 env/
 .env
@@ -37,7 +38,9 @@ __MACOSX/
 
 # Experiment tracking and generated run directories
 /runs/
+/runs
 /smoke_runs/
+/smoke_runs
 /sweep_runs/
 /wandb/
 /outputs/
@@ -45,6 +48,13 @@ __MACOSX/
 **/.hydra/
 **/checkpoints/
 **/samples/
+
+# Generated plots/snapshots
+/snapshot_figures/
+
+# NFS silly-rename artifacts (leftover from a file deleted while another
+# process still had it open -- not real files, never meaningful to track)
+.nfs*
 
 # Logs and scheduler output
 *.log
@@ -58,6 +68,9 @@ slurm-*.out
 
 # Local datasets and generated numerical data
 /data/
+/data
+/md_data/
+/md_data
 *.npy
 *.npz
 
@@ -67,3 +80,26 @@ slurm-*.out
 *.swp
 *.swo
 *~
+
+# SLURM batch launch scripts written during experimentation -- kept locally
+# (personal cluster paths, not meant to be public/tracked), but the 5
+# pre-existing ones (exec_asbs_gl.sh, exec_smoke.sh,
+# exec_smoke_general_asbs_iw.sh, exec_smoke_ring_gmm.sh,
+# exec_tr_asbs_iw_gl.sh) predate this and stay tracked as before.
+/exec_check_*.sh
+/exec_compute_*.sh
+/exec_diagnose_*.sh
+/exec_probe_*.sh
+/exec_smoke_*.sh
+!/exec_smoke_general_asbs_iw.sh
+!/exec_smoke_ring_gmm.sh
+/exec_snapshot_*.sh
+/exec_test_*.sh
+
+# One-off diagnostic/probe scripts written during experimentation -- kept
+# locally, not part of the paper's actual training/eval pipeline (which
+# imports from eval/eval_utils.py and eval/calculate_torsion_metrics.py
+# instead). tmp_brige.py predates this and is intentionally left tracked.
+/scratch_*.py
+/src/tr_asbs/experiment/check_*.py
+/src/tr_asbs/experiment/snapshot_eval*.py

@@ -1,0 +1,158 @@
+# @package _global_
+#
+# LJ-55 ASBS baseline (for train_asbs.py -- Eq. 14/15 in the paper, no
+# importance weighting, no trust region, plain fixed-point IPF iteration).
+# Needed as Phase 1 of the "ASBS -> IW/TR" curriculum (see
+# lj55_logvar_warmstart_asbs.yaml / lj55_ce_warmstart_asbs.yaml) -- no ASBS
+# baseline checkpoint existed yet for LJ-55 before this.
+#
+# Architecture/potential/buffer parameters copied from lj55_ce_fast.yaml (the
+# shrunk-EGNN LJ-55 config used across the ablation-style comparisons) so the
+# resulting checkpoint's controller/corrector are directly loadable into the
+# gamma_asbs_iw trainer for Phase 2 -- same potential (WITH ground-truth
+# samples, unlike LJ-38), same shrunk EGNN (3 layers/64 hidden/no attention).
+#
+# train_batch_size and integrator steps deliberately DIVERGE from
+# lj55_ce_fast.yaml, sped up for this ASBS-only phase:
+# - lj55_ce_fast.yaml's train_batch_size=12 exists only to fit the
+#   log-variance loss's dense batch_size*integrator_steps evaluation (see its
+#   own comment) -- plain ASBS's adjoint_matching_step/corrector_matching_step
+#   evaluate at only 2-3 time points per sample, so that constraint doesn't
+#   apply here at all. Measured throughput at batch=12/steps=200: ~111s/epoch,
+#   which would take >10 days to reach a usefully-converged checkpoint.
+# - integrator steps (200->50) isn't baked into the checkpoint -- it's a
+#   runtime resolution choice, not part of the network weights -- so Phase 2
+#   can still use the original 200-step config when loading this checkpoint.
+# Both changes combined are expected to give roughly a 4x (steps) x 8x (batch,
+# via better GPU utilization) speedup, pending an actual smoke-test check for
+# OOM before committing to a full run.
+
+name: lj55_asbs_baseline
+fabric:
+  loggers:
+    tags: [lj55, asbs_baseline]
+
+seed: 0
+compile: false
+
+################################################################################
+# Potentials
+################################################################################
+potential:
+  _target_: tr_asbs.potential.lennardjones_energy.LennardJonesEnergy
+  n_particles: 55
+  spatial_dim: 3
+  ref_samples_path: "./data/test_split_LJ55-1000-part1.npy"
+  energy_clip: 10000.0
+
+################################################################################
+# Settings for Gamma (unused by train_asbs.py, kept for config-schema parity)
+################################################################################
+gamma: 1.0
+gamma_schedule: trust_region
+trust_region_bound: 0.2
+iw_clip_value: 10
+
+################################################################################
+# Training settings
+################################################################################
+max_outer_loops: 50
+adjoint_matching_epochs: 300
+corrector_matching_epochs: 20
+steps_per_epoch: 300
+train_batch_size: 96
+inference_batch_size: 1000
+num_samples_for_dual_loss: [100, 10]
+
+################################################################################
+# Logging
+################################################################################
+log_detail_interval_epoch: 50
+monitor_values: ["loss/Eq-EMD2", "loss/neg_avg_energy"]
+
+################################################################################
+# Models
+################################################################################
+controller:
+  _target_: tr_asbs.model.egnn.EGNN_dynamics
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  n_layers: 3
+  hidden_nf: 64
+  attention: false
+  agg: sum
+  compile: ${compile}
+  clip_norm: 100.0
+
+corrector:
+  _target_: tr_asbs.model.egnn.EGNN_dynamics
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  n_layers: 3
+  hidden_nf: 64
+  attention: false
+  agg: sum
+  compile: ${compile}
+  clip_norm: 100.0
+
+################################################################################
+# Optimization
+################################################################################
+controller_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+corrector_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+gradient_clip_val: 100.0
+loss_1_weight: 1.0
+
+################################################################################
+# Buffers
+################################################################################
+adjoint_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 10000
+
+corrector_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 10000
+
+initial_buffer_samples: 1000
+buffer_samples_per_epoch: 1000
+log_buffer_energy: true
+log_buffer_grad_norm: true
+
+################################################################################
+# Process and integration
+################################################################################
+source:
+  _target_: tr_asbs.process.source.MeanFreePrior
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  scale: 1.0
+
+base_sde:
+  _target_: tr_asbs.process.sde.VESDE
+  sigma_min: 0.5
+  sigma_max: 2.0
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 50
+    rescale_t: null
+
+################################################################################
+# Terminal cost
+################################################################################
+terminal_cost:
+  _target_: tr_asbs.process.terminal_cost.ASBSTerminalCost
+  grad_clip_val: 100.0

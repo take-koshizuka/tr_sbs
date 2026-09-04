@@ -148,7 +148,11 @@ class BaseEnergy:
                 log['lag_multiplier/lambda'] = results['lm']
             if 'gamma' in results:
                 log['lag_multiplier/gamma'] = results['gamma']
-            
+            if 'gamma_h' in results:
+                log['lag_multiplier/gamma_h'] = results['gamma_h']
+            if hasattr(self, "lennard_jones") and hasattr(self.lennard_jones, "_softcore_alpha"):
+                log['potential/softcore_alpha'] = self.lennard_jones._softcore_alpha
+
         return log
     
     @torch.no_grad()

@@ -1,0 +1,226 @@
+# @package _global_
+
+# Cartesian-coordinate Ala2 gamma/TR-SBS run using a plain FourierMLP over
+# the flattened (66-dim) coordinate vector (flat-tensor pipeline) instead of
+# PaiNN (graph-batch atomic pipeline) -- an architecture ablation, motivated
+# by Ala2's PaiNN pipeline being ~5-7x slower per epoch than ALDP's flat
+# FourierMLP (measured from live SLURM logs: ~6s/epoch for ALDP vs
+# ~32-45s/epoch for Ala2/PaiNN).
+#
+# Precedent: mace_butane.yaml already uses FourierMLP for a real (14-atom)
+# Cartesian molecule under the same "atoms are chemically distinct, no
+# permutation-equivariance needed" rationale -- this applies equally to
+# Ala2's 22 atoms. The tradeoff PaiNN gets for free that a flat MLP does
+# not is rotational invariance -- Ala2 is a larger/more flexible molecule
+# than butane, so it's not guaranteed this transfers as cleanly.
+#
+# Deliberately NOT built via `defaults: [ala2]` -- Hydra/OmegaConf merges
+# same-named dict keys from a default recursively rather than replacing
+# them, so overriding e.g. `controller`/`source`/`potential` here would
+# have left PaiNN/GaussianSource/SumPotential's own incompatible fields
+# (num_features, r_max, pbc, cell, composition, ...) merged in alongside
+# this file's FourierMLP/MeanFreePrior/FlattenedAtomicPotential fields,
+# silently producing a broken config. Instead this file is fully
+# self-contained (same approach as mace_butane.yaml), duplicating the small
+# set of shared physical constants (composition/pbc/cell/temperature) and
+# the metadynamics/chirality-restraint blocks verbatim from ala2.yaml --
+# same underlying physics (OpenMM AlanineDipeptideImplicit + well-tempered
+# metadynamics bias + chirality restraints), just wrapped by
+# FlattenedAtomicPotential so the flat-tensor BaseEnergy interface
+# (.eval()/.grad_E()) can drive it.
+#
+# Launch via the FLAT trainer module
+# (tr_asbs.experiment.train_gamma_asbs_iw.GammaASBSModule), NOT
+# train_gamma_asbs_iw_ala2.GammaASBSAtomicModule -- this potential/source/
+# integrator combination is not graph-batch-aware.
+
+name: ala2_mlp_gamma_asbs_iw
+
+seed: 0
+compile: false
+
+################################################################################
+# Material setup (copied verbatim from ala2.yaml)
+################################################################################
+pbc: [false, false, false]
+cell: null
+temperature: 300.0
+composition: HCH2CONHCHCH3CONHCH3
+num_atoms: 22
+# See ala2.yaml for why this is val_split_AD.h5 (ALDP's own well-converged
+# 1M-frame reference, same molecule/topology) rather than the 100ps
+# ala2_0.1ns.pdb pretraining file.
+md_eval_pdb_file: ./data/val_split_AD.h5
+
+################################################################################
+# Gamma/TR-SBS settings -- same as ala2_gamma_asbs_iw.yaml, for a fair
+# architecture-only comparison.
+################################################################################
+gamma: 1.0
+gamma_schedule: trust_region
+trust_region_bound: 0.2
+gamma_floor: 0.05
+per_time_anchor_target: true
+iw_clip_value: 10.0
+num_samples_for_dual_loss: [128, 4]
+
+################################################################################
+# Models -- plain FourierMLP over the flattened (66-dim) Cartesian
+# coordinate vector, matching mace_butane.yaml's hyperparameters.
+################################################################################
+controller:
+  _target_: tr_asbs.model.mlp.FlattenReshapeWrapper
+  n_particles: 22
+  spatial_dim: 3
+  base_model:
+    _target_: tr_asbs.model.mlp.FourierMLP
+    dim: 66 # 22 atoms * 3 spatial dims
+    num_layers: 6
+    channels: 256
+    clip_norm: 100.0
+
+corrector:
+  _target_: tr_asbs.model.mlp.FlattenReshapeWrapper
+  n_particles: 22
+  spatial_dim: 3
+  base_model:
+    _target_: tr_asbs.model.mlp.FourierMLP
+    dim: 66
+    num_layers: 6
+    channels: 256
+    clip_norm: 100.0
+
+################################################################################
+# Optimization
+################################################################################
+controller_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+corrector_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+gradient_clip_val: 100.0
+loss_1_weight: 1.0
+
+################################################################################
+# Process and integration -- flat-tensor counterparts of ala2.yaml's
+# graph-batch source/integrator.
+################################################################################
+source:
+  _target_: tr_asbs.process.source.MeanFreePrior
+  n_particles: 22
+  spatial_dim: 3
+  scale: 1.0
+
+base_sde:
+  _target_: tr_asbs.process.sde.EDMSDE
+  sigma_min: 0.001
+  sigma_max: 6.0
+  rho: 3.0
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 250
+    rescale_t: null
+
+################################################################################
+# Potential -- same physics as ala2.yaml (OpenMM AlanineDipeptideImplicit +
+# well-tempered metadynamics bias + chirality restraints), wrapped for the
+# flat-tensor pipeline.
+################################################################################
+potential:
+  _target_: tr_asbs.potential.flattened_atomic_energy.FlattenedAtomicPotential
+  n_particles: 22
+  spatial_dim: 3
+  composition: ${composition}
+  pbc: ${pbc}
+  cell: ${cell}
+  temperature: ${temperature}
+  ref_samples_path: ${md_eval_pdb_file}
+  atomic_potential:
+    _target_: tr_asbs.potential.base.SumPotential
+    potentials:
+      - _target_: tr_asbs.potential.openmm.OpenMMPotential
+        system:
+          _target_: openmmtools.testsystems.AlanineDipeptideImplicit
+          constraints: null
+        device: cuda
+      - ${metadynamics}
+      - ${chirality_restraint_1}
+      - ${chirality_restraint_2}
+
+metadynamics:
+  _target_: tr_asbs.potential.metadynamics.WellTemperedMetadynamicsBias
+  cv: ${cv}
+  height: 0.0005
+  sigma: [0.2, 0.2]
+  grid_min: [-3.141592653589793, -3.141592653589793]
+  grid_max: [3.141592653589793, 3.141592653589793]
+  grid_bin: [150, 150]
+  bias_factor: 8.0
+  temperature: ${temperature}
+  add_every_epoch: 1
+  skip_initial_epochs: 50
+
+cv:
+  _target_: tr_asbs.potential.metadynamics.collective_variable.TorsionCV
+  indices: [[4, 6, 8, 14], [6, 8, 14, 16]]
+
+chirality_restraint_1: # Restraint for L-amino acid (CA, N, C, CB improper torsion)
+  _target_: tr_asbs.potential.metadynamics.restraint.ChiralityRestraint
+  indices: [[8, 6, 14, 10]]
+  location: 0.6154797086703873 # +35 deg
+  force_constant: 25.0 # eV/rad^2
+
+chirality_restraint_2: # Restraint for L-amino acid (CA, N, C, HA improper torsion)
+  _target_: tr_asbs.potential.metadynamics.restraint.ChiralityRestraint
+  indices: [[8, 6, 14, 9]]
+  location: -0.6154797086703873 # -35 deg
+  force_constant: 25.0 # eV/rad^2
+
+terminal_cost:
+  _target_: tr_asbs.process.terminal_cost.ASBSTerminalCost
+  grad_clip_val: 100.0
+
+################################################################################
+# Buffers -- flat BatchBuffer instead of graph-batch ThermoAtomicDataBuffer.
+################################################################################
+adjoint_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 2048
+
+corrector_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 2048
+
+initial_buffer_samples: 2048
+buffer_samples_per_epoch: 256
+log_buffer_energy: true
+log_buffer_grad_norm: true
+
+################################################################################
+# Training-loop settings -- same epoch budget as ala2_gamma_asbs_iw.yaml.
+################################################################################
+max_outer_loops: 2000 # effectively unbounded given the SLURM time limit; run until killed
+adjoint_matching_epochs: 500
+corrector_matching_epochs: 250
+monitor_values: ["loss/neg_avg_energy"]
+train_batch_size: 64
+inference_batch_size: 64
+steps_per_epoch: 100
+
+################################################################################
+# Logging
+################################################################################
+save_samples: true
+visualize: true # periodic marginal-torsion + Ramachandran plots in log_details
+log_detail_interval_epoch: 25
+eval_samples: 2000

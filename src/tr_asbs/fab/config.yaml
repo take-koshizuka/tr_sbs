@@ -2,7 +2,7 @@
 
 
 data:
-  transform: experiments/aldp/data/position_min_energy.pt
+  transform: data/val_split_AD.h5
   test: data/val.pt
 
 
@@ -11,7 +11,12 @@ system:                             # Properties of molecular system
   temperature: 300                  # Double, temperature of the system
   energy_cut: 1.e+8                 # Double, energy level at which regularization shall be applied
   energy_max: 1.e+20                # Double, maximum level at which energies will be clamped
-  n_threads: 18                     # Int, number of threads to be used, number of cores if null
+  n_threads: 1                      # Int, number of threads to be used, number of cores if null
+                                     # (n_threads>1 routes through TransformedBoltzmannParallel,
+                                     # a CPU-multiprocessing wrapper for OpenMM energy calls that
+                                     # was causing a device mismatch (cuda vs cpu) inside the
+                                     # coordinate transform during GPU training -- see the
+                                     # investigation notes for exec_smoke_ad_ic_gamma_asbs.sh)
   transform: internal
   shift_dih: False
   env: implicit

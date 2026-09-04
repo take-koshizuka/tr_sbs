@@ -1,0 +1,45 @@
+# @package _global_
+defaults:
+  - ala2
+
+name: ala2_gamma_asbs_iw
+
+################################################################################
+# Gamma/TR-SBS settings -- same hyperparameters as ay1i0pd5 (our best LJ-13
+# result, monotonic convergence via gamma_floor=0.05 + per_time_anchor_target).
+################################################################################
+gamma: 1.0
+gamma_schedule: trust_region
+trust_region_bound: 0.2
+gamma_floor: 0.05
+per_time_anchor_target: true
+iw_clip_value: 10.0
+num_samples_for_dual_loss: [128, 4]
+
+# Exact analytic transition density (matches our LJ-13/ALDP gamma dual-solve
+# convention) instead of ala2.yaml's default EulerMaruyamaIntegrator, needed
+# for numerically stable Girsanov log-weight computation in run_with_logweights.
+integrator:
+  _target_: tr_asbs.process.integrator.AtomicExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 250
+    rescale_t: null
+
+################################################################################
+# Training-loop settings used by train_gamma_asbs_iw_ala2.py (replaces the
+# curriculum-based structure used by train_wt_asbs.py/pretrain_bm.py).
+################################################################################
+max_outer_loops: 2000  # effectively unbounded given the SLURM time limit; run until killed
+adjoint_matching_epochs: 500
+corrector_matching_epochs: 250
+monitor_values: ["loss/neg_avg_energy"]
+
+################################################################################
+# Logging
+################################################################################
+save_samples: true
+visualize: true  # periodic marginal-torsion + Ramachandran plots in log_details
+# md_eval_pdb_file inherited from ala2.yaml

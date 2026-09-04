@@ -1,0 +1,151 @@
+# @package _global_
+#
+# LJ-38, identical to lj38_adaptive_tr.yaml (EGNN, adaptive trust-region radius)
+# EXCEPT the u-controller uses the log-variance FC loss instead of cross-entropy
+# -- see adjoint_matching_log_variance_step in train_gamma_asbs_iw.py. Uses the
+# bisection-based adapt_trust_region_bound (searches between the tightest known
+# "gamma inactive" epsilon and loosest known "gamma stuck" epsilon, rather than
+# fixed-factor growth/shrink), aiming to land gamma in the target middle range
+# instead of the bimodal ~0 / ~1 extremes seen with the earlier fixed-factor
+# scheme.
+
+name: lj38_egnn_logvar_adaptivetr_tr_asbs
+fabric:
+  loggers:
+    tags: [lj38, egnn, eval25, log_variance, adaptive_trust_region]
+
+seed: 0
+compile: false
+
+################################################################################
+# Potentials
+################################################################################
+potential:
+  _target_: tr_asbs.potential.lennardjones_energy.LennardJonesEnergyNoGT
+  n_particles: 38
+  spatial_dim: 3
+  energy_clip: 10000.0 # clip each pairwise LJ term to avoid 1/r^12 blowups from near-overlaps
+
+################################################################################
+# Settings for Gamma
+################################################################################
+gamma: 1.0
+gamma_schedule: trust_region
+trust_region_bound: 0.2 # starting epsilon
+
+# Use the importance-weight-free log-variance FC loss instead of cross-entropy.
+fc_loss_mode: log_variance
+
+# Adaptive trust-region radius (see adapt_trust_region_bound in train_gamma_asbs_iw.py)
+trust_region_adaptive: true
+trust_region_gamma_low: 0.05   # below this, gamma is considered "stuck" -> grow epsilon
+trust_region_gamma_high: 0.9   # above this, trust region is "slack" -> shrink epsilon
+trust_region_growth_factor: 3.0
+trust_region_shrink_factor: 0.5
+trust_region_patience: 1       # consecutive outer loops before adapting
+trust_region_bound_min: 0.001
+trust_region_bound_max: 1000.0
+iw_clip_value: 5.0
+
+################################################################################
+# Training settings
+################################################################################
+max_outer_loops: 30
+adjoint_matching_epochs: 200
+corrector_matching_epochs: 50
+steps_per_epoch: 100
+train_batch_size: 150
+inference_batch_size: 500
+num_samples_for_dual_loss: [500, 20]
+
+################################################################################
+# Logging
+################################################################################
+log_detail_interval_epoch: 25
+monitor_values: ["loss/neg_avg_energy"]
+
+################################################################################
+# Models
+################################################################################
+controller:
+  _target_: tr_asbs.model.egnn.EGNN_dynamics
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  n_layers: 3
+  hidden_nf: 64
+  attention: false
+  agg: sum
+  compile: ${compile}
+  clip_norm: 100.0
+
+corrector:
+  _target_: tr_asbs.model.egnn.EGNN_dynamics
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  n_layers: 3
+  hidden_nf: 64
+  attention: false
+  agg: sum
+  compile: ${compile}
+  clip_norm: 100.0
+
+################################################################################
+# Optimization
+################################################################################
+controller_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+corrector_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+gradient_clip_val: 100.0
+
+################################################################################
+# Buffers
+################################################################################
+adjoint_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+corrector_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+initial_buffer_samples: 500
+buffer_samples_per_epoch: 500
+log_buffer_energy: true
+log_buffer_grad_norm: true
+
+################################################################################
+# Process and integration
+################################################################################
+source:
+  _target_: tr_asbs.process.source.MeanFreePrior
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  scale: 1.5
+
+base_sde:
+  _target_: tr_asbs.process.sde.VESDE
+  sigma_min: 0.1
+  sigma_max: 1.0
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 100
+    rescale_t: null
+
+################################################################################
+# Terminal cost
+################################################################################
+terminal_cost:
+  _target_: tr_asbs.process.terminal_cost.ASBSTerminalCost
+  grad_clip_val: 100.0

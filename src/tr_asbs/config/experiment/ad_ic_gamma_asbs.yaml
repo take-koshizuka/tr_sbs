@@ -12,8 +12,20 @@ compile: false
 ################################################################################
 potential:
   _target_: tr_asbs.potential.alanine_dipeptide_energy.AlanineDipeptideEnergyIC
-  dim: 66
+  dim: 66  # Cartesian (22 particles * 3 spatial dims) -- required by the class's
+           # own assert (dim == n_particles*spatial_dim) and by sample()'s
+           # ground-truth reshaping. NOT the working dimension for the SDE/
+           # network -- see ic_dim below.
   ref_samples_path: "./data/val_split_AD.h5"
+
+# eval()/grad_E()/log_details() all actually operate in the internal-coordinate
+# (Z-matrix) "z" space, which for ALDP has 60 dims (66 Cartesian minus 6
+# removed translational+rotational degrees of freedom), NOT potential.dim (66,
+# Cartesian "x" space, only used internally for ground-truth reshaping). The
+# source/controller/corrector must be sized to ic_dim, not potential.dim --
+# verified directly: pot.grad_E(z) where z = pot.aldp_potential.x_to_z(x) has
+# shape (B, 60), not (B, 66).
+ic_dim: 60
 
 ################################################################################
 # Settings for Gamma
@@ -45,14 +57,14 @@ log_detail_interval_epoch: 500
 ################################################################################
 controller:
   _target_: tr_asbs.model.mlp.FourierMLP
-  dim: ${potential.dim}
+  dim: ${ic_dim}
   num_layers: 8
   channels: 256
   clip_norm: 100.0
 
 corrector:
   _target_: tr_asbs.model.mlp.FourierMLP
-  dim: ${potential.dim}
+  dim: ${ic_dim}
   num_layers: 8
   channels: 256
   clip_norm: 100.0
@@ -93,7 +105,7 @@ log_buffer_grad_norm: true
 ################################################################################
 source:
   _target_: tr_asbs.process.source.GaussianPrior
-  dim: ${potential.dim}
+  dim: ${ic_dim}
   scale: 1.0
 
 base_sde:

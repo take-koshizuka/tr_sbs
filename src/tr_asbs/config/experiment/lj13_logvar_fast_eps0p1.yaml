@@ -1,0 +1,170 @@
+# @package _global_
+#
+# LJ-13, log-variance FC loss, "fast" variant of lj13_logvar.yaml: EGNN shrunk
+# to the same size as the working LJ-38 log-variance run (3 layers, 64 hidden,
+# no attention). Gives ~3x more throughput per row from the architecture shrink
+# alone (measured, scratch_egnn_speed_probe.py), letting batch_size go up to
+# 150 (~31GB, measured scratch_egnn_mem_probe_lj13_shrunk_fp32.py, safe margin
+# below 44GB) instead of the full-size version's 24.
+#
+# bf16 autocast (logvar_amp_dtype) was tried here and REMOVED: it produced a
+# subtle, severe correctness bug, not just a speed/precision tradeoff. Run
+# zhhjmbk7 (this config + bf16) showed RN[h|u]/ess climbing to ~0.99 (looks
+# healthy) while loss/neg_avg_energy swung across 29 orders of magnitude
+# (1e2 to 1e29) and loss/energy_W_2 hit Infinity -- i.e. the controller and
+# corrector had degenerated together into agreeing on unphysical garbage, which
+# the internal ESS/RN metric can't detect (it only measures u/h mutual
+# agreement, not agreement with the ground-truth reference samples). Isolated
+# via the CE-fast run (same shrunk arch, no bf16 since cross_entropy doesn't
+# autocast): energy=63, Eq-EMD2=7.79, energy_W_2=106 -- all sane. So the shrunk
+# architecture itself is fine; bf16 specifically was the bug.
+#
+# Two further fixes found by auditing why global_step lagged epoch*steps_per_epoch
+# so badly (only ~6.4% of computed batches were producing an actual optimizer
+# step, per training_step()'s "if not torch.isfinite(loss): return False" /
+# non-finite-gradient skip -- measured on azya1pwz: epoch 25->825 advanced
+# global_step by only 5135 vs a nominal 80,000):
+# 1. energy_clip added to LennardJonesEnergy (previously only LennardJonesEnergyNoGT
+#    supported it) -- a single near-overlapping pair's unclipped 1/r^12 term could
+#    blow up to near-float-max, poisoning the whole batch's loss/gradient into
+#    non-finite territory and triggering the skip. 10000.0 matches the value
+#    already validated on LJ-38 (same eps=1/rm=1 per-pair LJ formula).
+# 2. iw_clip_value raised from a stray 1.0 (found in the original lj13.yaml) to
+#    5.0, matching LJ-38's convention -- 1.0 caps every importance weight at
+#    exactly the mean (since normalize_log_weights centers weights at ~1), so no
+#    sample could ever contribute above-average signal to the CE loss.
+
+name: lj13_egnn_logvar_fast_eps0p1_tr_asbs
+fabric:
+  loggers:
+    tags: [lj13, egnn, log_variance, fast, eps0p1]
+
+seed: 0
+compile: false
+
+################################################################################
+# Potentials
+################################################################################
+potential:
+  _target_: tr_asbs.potential.lennardjones_energy.LennardJonesEnergy
+  n_particles: 13
+  spatial_dim: 3
+  ref_samples_path: "./data/test_split_LJ13-1000.npy"
+  energy_clip: 10000.0
+
+################################################################################
+# Settings for Gamma
+################################################################################
+gamma: 1.0
+gamma_schedule: trust_region
+trust_region_bound: 0.1
+iw_clip_value: 5.0
+
+# Use the importance-weight-free log-variance FC loss instead of cross-entropy.
+fc_loss_mode: log_variance
+
+################################################################################
+# Training settings
+################################################################################
+max_outer_loops: 2000 # effectively unbounded given the SLURM time limit; run until killed
+adjoint_matching_epochs: 200
+corrector_matching_epochs: 50
+steps_per_epoch: 100
+train_batch_size: 150
+inference_batch_size: 1000
+num_samples_for_dual_loss: [500, 20]
+
+################################################################################
+# Logging
+################################################################################
+log_detail_interval_epoch: 25
+monitor_values: ["loss/Eq-EMD2", "loss/neg_avg_energy"]
+
+################################################################################
+# Models
+################################################################################
+controller:
+  _target_: tr_asbs.model.egnn.EGNN_dynamics
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  n_layers: 3
+  hidden_nf: 64
+  attention: false
+  agg: sum
+  compile: ${compile}
+  clip_norm: 100.0
+
+corrector:
+  _target_: tr_asbs.model.egnn.EGNN_dynamics
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  n_layers: 3
+  hidden_nf: 64
+  attention: false
+  agg: sum
+  compile: ${compile}
+  clip_norm: 100.0
+
+################################################################################
+# Optimization
+################################################################################
+controller_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+corrector_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+gradient_clip_val: 100.0
+loss_1_weight: 1.0
+
+################################################################################
+# Buffers
+################################################################################
+adjoint_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+corrector_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+initial_buffer_samples: 1000
+buffer_samples_per_epoch: 1000
+log_buffer_energy: true
+log_buffer_grad_norm: true
+
+################################################################################
+# Process and integration
+################################################################################
+source:
+  _target_: tr_asbs.process.source.MeanFreePrior
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  scale: 2.0
+
+base_sde:
+  _target_: tr_asbs.process.sde.VESDE
+  sigma_min: 0.001
+  sigma_max: 0.5
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 200
+    rescale_t: null
+
+################################################################################
+# Terminal cost
+################################################################################
+terminal_cost:
+  _target_: tr_asbs.process.terminal_cost.ASBSTerminalCost
+  grad_clip_val: 100.0
+
+E_max: 10000

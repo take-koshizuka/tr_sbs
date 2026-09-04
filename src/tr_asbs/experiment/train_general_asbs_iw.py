@@ -1309,8 +1309,6 @@ def main(cfg: DictConfig) -> None:
     use_wandb_logger = "wandb" in logger_target
     if use_wandb_logger:
         os.environ["WANDB_BASE_URL"] = str(cfg.wandb_host)
-        os.environ["WANDB_API_KEY"] = str(cfg.wandb_key)
-        wandb.login(key=os.environ["WANDB_API_KEY"], relogin=True)
     torch.set_float32_matmul_precision("high")
     trainer = GeneralASBSModule(cfg)
     trainer.fit()

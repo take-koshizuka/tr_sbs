@@ -131,21 +131,42 @@ def compute_joint_W2(gen_samples, ref_samples, n_particles: int, spatial_dim: in
 # ==========================================
 # 4. 可視化関数
 # ==========================================
-def plot_ramachandran_AD(samples: torch.Tensor, n_particles: int, spatial_dim: int, weights=None, title: str = None) -> dict:
+def plot_ramachandran_AD(samples: torch.Tensor, n_particles: int, spatial_dim: int, ref_samples: torch.Tensor = None, weights=None, title: str = None, nbins: int = 64, gen_run_id: str = None) -> dict:
+    """2D phi/psi Ramachandran histogram for `samples` (generated). If
+    `ref_samples` is given, a second panel with the reference (MD) data is
+    plotted alongside it for a direct visual comparison. `gen_run_id` (e.g.
+    the source W&B run id) is appended to the "generated" panel's title."""
     angles = extract_phi_psi(compute_all_dihedrals(samples, n_particles=n_particles, spatial_dim=spatial_dim))
     phi, psi = angles[:, 0].numpy(), angles[:, 1].numpy()
+    bins = [np.linspace(-np.pi, np.pi, nbins), np.linspace(-np.pi, np.pi, nbins)]
 
-    fig, ax = plt.subplots(figsize=(4, 4))
-    bins = [np.linspace(-np.pi, np.pi, 64), np.linspace(-np.pi, np.pi, 64)]
-    ax.hist2d(phi, psi, bins=bins, norm=mpl.colors.LogNorm(), weights=weights)
-    ax.set_xlabel(r'$\phi$')
-    ax.set_ylabel(r'$\psi$')
-    ax.set_xlim(-np.pi, np.pi)
-    ax.set_ylim(-np.pi, np.pi)
+    ncols = 2 if ref_samples is not None else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(4 * ncols, 4), squeeze=False)
+    axes = axes[0]
+
+    gen_title = "generated" if ref_samples is not None else None
+    if gen_title is not None and gen_run_id is not None:
+        gen_title = f"generated ({gen_run_id})"
+
+    axes[0].hist2d(phi, psi, bins=bins, norm=mpl.colors.LogNorm(), weights=weights)
+    axes[0].set_title(gen_title)
+    axes[0].set_xlabel(r'$\phi$')
+    axes[0].set_ylabel(r'$\psi$')
+    axes[0].set_xlim(-np.pi, np.pi)
+    axes[0].set_ylim(-np.pi, np.pi)
+
+    if ref_samples is not None:
+        ref_angles = extract_phi_psi(compute_all_dihedrals(ref_samples, n_particles=n_particles, spatial_dim=spatial_dim))
+        ref_phi, ref_psi = ref_angles[:, 0].numpy(), ref_angles[:, 1].numpy()
+        axes[1].hist2d(ref_phi, ref_psi, bins=bins, norm=mpl.colors.LogNorm())
+        axes[1].set_title("reference")
+        axes[1].set_xlabel(r'$\phi$')
+        axes[1].set_xlim(-np.pi, np.pi)
+        axes[1].set_ylim(-np.pi, np.pi)
 
     PIL_im = fig2img(fig)
     plt.close(fig)
-    
+
     key = f"figures/ramachandran_{title}" if title else "figures/ramachandran"
     return {key: wandb.Image(PIL_im)}
 

@@ -11,7 +11,7 @@ set -euo pipefail
 
 source ~/.profile
 cd /home/htc/tkoshizuka/tr_asbs
-RUN_ROOT="${PWD}/smoke_runs"
+RUN_ROOT="/home/htc/lrichter/SCRATCH/tr_asbs_data/smoke_runs"
 mkdir -p "${RUN_ROOT}"
 
 COMMON_OVERRIDES=(

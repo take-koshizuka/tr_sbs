@@ -1,0 +1,137 @@
+# @package _global_
+#
+# Identical to lj38_mlp.yaml (FourierMLP, cross-entropy loss) except
+# trust_region_bound=0.01 -- part of a small-epsilon sweep (0.01/0.05/0.1)
+# testing whether gamma stays frozen (as at eps=0.2) or starts moving at
+# smaller epsilon, per App. E.3 of the trust-region SOC paper.
+
+name: lj38_mlp_eps0p01_tr_asbs
+fabric:
+  loggers:
+    tags: [lj38, fouriermlp, eval25, eps0p01]
+
+seed: 0
+compile: false
+
+################################################################################
+# Potentials
+################################################################################
+potential:
+  _target_: tr_asbs.potential.lennardjones_energy.LennardJonesEnergyNoGT
+  n_particles: 38
+  spatial_dim: 3
+  energy_clip: 10000.0 # clip each pairwise LJ term to avoid 1/r^12 blowups from near-overlaps
+
+################################################################################
+# Settings for Gamma
+################################################################################
+gamma: 1.0
+gamma_schedule: trust_region
+trust_region_bound: 0.01
+iw_clip_value: 5.0
+
+################################################################################
+# Training settings
+################################################################################
+max_outer_loops: 2000 # effectively unbounded given the ~2-day SLURM time limit; run until killed by that
+adjoint_matching_epochs: 200
+corrector_matching_epochs: 50
+steps_per_epoch: 100
+train_batch_size: 150
+inference_batch_size: 500
+num_samples_for_dual_loss: [500, 20]
+
+################################################################################
+# Logging
+################################################################################
+log_detail_interval_epoch: 25
+monitor_values: ["loss/neg_avg_energy"]
+
+################################################################################
+# Models
+################################################################################
+# Particle data flows through the SDE integrator as (batch, n_particles, spatial_dim)
+# (same as the EGNN variant needs), so FourierMLP -- a flat-vector model -- is wrapped
+# to flatten/reshape around it, so it sees the full joint (114-dim) configuration.
+controller:
+  _target_: tr_asbs.model.mlp.FlattenReshapeWrapper
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  base_model:
+    _target_: tr_asbs.model.mlp.FourierMLP
+    dim: 114 # = n_particles * spatial_dim (38 * 3)
+    num_layers: 6
+    channels: 512
+    clip_norm: 100.0
+
+corrector:
+  _target_: tr_asbs.model.mlp.FlattenReshapeWrapper
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  base_model:
+    _target_: tr_asbs.model.mlp.FourierMLP
+    dim: 114 # = n_particles * spatial_dim (38 * 3)
+    num_layers: 6
+    channels: 512
+    clip_norm: 100.0
+
+################################################################################
+# Optimization
+################################################################################
+controller_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+corrector_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+gradient_clip_val: 100.0
+
+################################################################################
+# Buffers
+################################################################################
+adjoint_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+corrector_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+initial_buffer_samples: 500
+buffer_samples_per_epoch: 500
+log_buffer_energy: true
+log_buffer_grad_norm: true
+
+################################################################################
+# Process and integration
+################################################################################
+source:
+  _target_: tr_asbs.process.source.MeanFreePrior
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  scale: 1.5
+
+base_sde:
+  _target_: tr_asbs.process.sde.VESDE
+  sigma_min: 0.1
+  sigma_max: 1.0
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 100
+    rescale_t: null
+
+################################################################################
+# Terminal cost
+################################################################################
+terminal_cost:
+  _target_: tr_asbs.process.terminal_cost.ASBSTerminalCost
+  grad_clip_val: 100.0

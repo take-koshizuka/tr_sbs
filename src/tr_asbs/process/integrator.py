@@ -12,9 +12,13 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from tr_asbs.process.sde import BaseSDE, FwdBwdSDE, DataType
-from tr_asbs.utils.geometry import subtract_com_vector
+from tr_asbs.process.sde import BaseSDE, FwdBwdSDE, DataType, _is_graph_data
+from tr_asbs.utils.geometry import subtract_com_vector, subtract_mean_batch
 from tr_asbs.utils.gaussian_utils import gaussian_log_prob
+
+
+def _get_device(data: DataType) -> torch.device:
+    return data.pos.device if _is_graph_data(data) else data.device
 
 
 def get_timesteps(
@@ -101,7 +105,7 @@ class BaseIntegrator(nn.Module, ABC):
                 raise ValueError("No timesteps provided and no default timesteps set.")
             timesteps = self.timesteps
 
-        timesteps = timesteps.to(initial_data.device)
+        timesteps = timesteps.to(_get_device(initial_data))
         data = initial_data.clone() if hasattr(initial_data, "clone") else initial_data
 
         trajectory = [data] if return_trajectory else []
@@ -129,6 +133,10 @@ class BaseIntegrator(nn.Module, ABC):
     # ---------- Utilities ----------
     def _apply_centering(self, data: DataType):
         """Helper to apply CoM centering."""
+        if _is_graph_data(data):
+            data = data.clone()
+            data.pos = subtract_mean_batch(data.pos, data.batch)
+            return data
         return subtract_com_vector(data, data.shape[-2], data.shape[-1])
         
     @abstractmethod
@@ -160,7 +168,7 @@ class BaseIntegrator(nn.Module, ABC):
                 raise ValueError("No timesteps provided and no default timesteps set.")
             timesteps = self.timesteps
         
-        timesteps = timesteps.to(final_data.device)
+        timesteps = timesteps.to(_get_device(final_data))
         assert timesteps[0] < timesteps[-1], "Timesteps should be in ascending order."
         # Reverse the timesteps
         times = timesteps.flip(0)
@@ -210,9 +218,9 @@ class BaseIntegrator(nn.Module, ABC):
                 raise ValueError("No timesteps provided.")
             timesteps = self.timesteps
 
-        timesteps = timesteps.to(initial_data.device)
+        timesteps = timesteps.to(_get_device(initial_data))
         data = initial_data
-        device = data.device
+        device = _get_device(data)
 
         batch_size = initial_data.shape[0]
         D = data.reshape(batch_size, -1).shape[1]
@@ -355,4 +363,181 @@ class ExponentialIntegrator(BaseIntegrator):
         diffusion = diff_sq.sqrt() * self.sde.randn_like(data)
         deterministic_prev = data + drift
         stochastic_prev = deterministic_prev + diffusion
+        return deterministic_prev, stochastic_prev
+
+
+class AtomicIntegratorMixin:
+    """Shared graph-batch (ThermoAtomicData) overrides for the Girsanov
+    log-weight (run_with_logweights) bookkeeping used by the gamma dual-solve.
+
+    Assumes a HOMOGENEOUS batch (every graph has the same number of atoms --
+    true for a fixed single-molecule system like Ala2), so per-graph atomic
+    coordinates can be safely reshaped to a flat (batch_size, D) feature
+    vector for the log-density math -- mirroring the existing flat-tensor
+    run_with_logweights exactly, just extracting/reinserting .pos from/into
+    a ThermoAtomicData shell at each step instead of operating on a raw
+    tensor throughout.
+    """
+
+    @torch.no_grad()
+    def run_with_logweights(
+        self,
+        integrator: "BaseIntegrator",
+        prior_log_prob_fn: Callable,
+        target_log_prob_fn: Callable,
+        initial_data: DataType,
+        timesteps: torch.Tensor | None = None,
+        center_every_step: bool = True,
+        zero_last_step_noise: bool = False,
+        return_trajectory: bool = False,
+        progress_bar: bool = False,
+    ) -> Dict[str, Any]:
+        if timesteps is None:
+            if not hasattr(self, "timesteps"):
+                raise ValueError("No timesteps provided.")
+            timesteps = self.timesteps
+
+        timesteps = timesteps.to(initial_data.pos.device)
+        data = initial_data
+        device = data.pos.device
+
+        batch_size = data.num_graphs
+        atoms_per_graph = data.pos.shape[0] // batch_size
+        D = atoms_per_graph * data.pos.shape[1]
+
+        log_Pref_Ph = torch.zeros(batch_size, device=device)
+        log_Pref_Pu = torch.zeros(batch_size, device=device)
+        log_Pref_Pu_det = torch.zeros(batch_size, device=device)
+
+        trajectory = [data] if return_trajectory else []
+
+        log_Pref_Ph += prior_log_prob_fn(data)
+        iterator = range(len(timesteps) - 1)
+
+        if progress_bar:
+            iterator = tqdm(iterator, desc="sdeint", leave=False)
+
+        same_integrator = integrator is self
+
+        for i in iterator:
+            t = timesteps[i]
+            t_next = timesteps[i + 1]
+            dt = t_next - t
+            fwd_mean_ref, next_data_stochastic = self.step(data, time=t, dt=dt)
+            if same_integrator:
+                fwd_mean = fwd_mean_ref
+            else:
+                fwd_mean, _ = integrator.step(data.clone(), time=t, dt=dt)
+
+            is_last_step = i == len(timesteps) - 2
+            next_data = fwd_mean_ref if (zero_last_step_noise and is_last_step) else next_data_stochastic
+
+            if center_every_step:
+                next_data = self._apply_centering(next_data)
+
+            bwd_mean, _ = integrator.step_backward(next_data.clone(), time=t_next, dt=dt)
+
+            diff_sq = self.sde.base_sde.diffsquare_integral(t_next) - self.sde.base_sde.diffsquare_integral(t)
+            sigma_step = diff_sq.clamp(min=1e-20).sqrt()
+
+            fwd_ref_pos = fwd_mean_ref.pos.reshape(batch_size, D)
+            fwd_pos = fwd_mean.pos.reshape(batch_size, D)
+            next_pos = next_data.pos.reshape(batch_size, D)
+            bwd_pos = bwd_mean.pos.reshape(batch_size, D)
+            data_pos = data.pos.reshape(batch_size, D)
+
+            diff_means = fwd_ref_pos - fwd_pos
+            var_step = sigma_step.pow(2)
+            log_Pref_Pu_det += 0.5 * (diff_means.pow(2) / var_step).sum(dim=-1)
+
+            if sigma_step.numel() == 1:
+                sigma_step_expand = torch.full((batch_size, D), sigma_step.item(), device=device)
+            else:
+                sigma_step_expand = sigma_step
+
+            log_prob_ref_step = gaussian_log_prob(next_pos, fwd_ref_pos, sigma_step_expand, D)
+            log_prob_model_fwd_step = gaussian_log_prob(next_pos, fwd_pos, sigma_step_expand, D)
+            log_prob_model_bwd_step = gaussian_log_prob(data_pos, bwd_pos, sigma_step_expand, D)
+
+            log_Pref_Ph += (log_prob_ref_step - log_prob_model_bwd_step)
+            log_Pref_Pu += (log_prob_ref_step - log_prob_model_fwd_step)
+
+            data = next_data
+            if return_trajectory:
+                trajectory.append(data)
+
+        target_log_prob = target_log_prob_fn(data)
+        log_Pref_Ph -= target_log_prob
+
+        return {
+            "data_1": data,
+            "trajectory": trajectory if return_trajectory else [initial_data, data],
+            "log_Ph_Pref": -log_Pref_Ph,
+            "log_Pu_Pref": -log_Pref_Pu,
+            "log_Pref_Pu_det": log_Pref_Pu_det,
+        }
+
+
+class AtomicEulerMaruyamaIntegrator(AtomicIntegratorMixin, EulerMaruyamaIntegrator):
+    """Graph-batch (ThermoAtomicData) counterpart of EulerMaruyamaIntegrator."""
+
+    @torch.no_grad()
+    def step(
+        self, data: DataType, time: torch.Tensor, dt: torch.Tensor
+    ) -> Tuple[DataType, DataType]:
+        dtype = data.pos.dtype
+        drift = self.sde.drift(time, data) * dt
+        diffusion = self.sde.diffusion(time) * dt.sqrt() * self.sde.randn_like(data)
+        deterministic_next = data.clone()
+        deterministic_next.pos = (data.pos + drift).to(dtype)
+        stochastic_next = data.clone()
+        stochastic_next.pos = (deterministic_next.pos + diffusion).to(dtype)
+        return deterministic_next, stochastic_next
+
+    @torch.no_grad()
+    def step_backward(
+        self, data: DataType, time: torch.Tensor, dt: torch.Tensor
+    ) -> Tuple[DataType, DataType]:
+        dtype = data.pos.dtype
+        if hasattr(self.sde, "bwd_drift"):
+            drift = (-self.sde.bwd_drift(time, data)) * (-dt)
+        else:
+            drift = (-self.sde.drift(time, data)) * (-dt)
+        diffusion = self.sde.diffusion(time) * dt.sqrt() * self.sde.randn_like(data)
+        deterministic_prev = data.clone()
+        deterministic_prev.pos = (data.pos + drift).to(dtype)
+        stochastic_prev = data.clone()
+        stochastic_prev.pos = (deterministic_prev.pos + diffusion).to(dtype)
+        return deterministic_prev, stochastic_prev
+
+
+class AtomicExponentialIntegrator(AtomicIntegratorMixin, ExponentialIntegrator):
+    """Graph-batch (ThermoAtomicData) counterpart of ExponentialIntegrator."""
+
+    @torch.no_grad()
+    def step(
+        self, data: DataType, time: torch.Tensor, dt: torch.Tensor
+    ) -> Tuple[DataType, DataType]:
+        dtype = data.pos.dtype
+        drift = self.sde.drift(time, data) * dt
+        diff_sq = self.sde.base_sde.diffsquare_integral(time + dt) - self.sde.base_sde.diffsquare_integral(time)
+        diffusion = diff_sq.sqrt() * self.sde.randn_like(data)
+        deterministic_next = data.clone()
+        deterministic_next.pos = (data.pos + drift).to(dtype)
+        stochastic_next = data.clone()
+        stochastic_next.pos = (deterministic_next.pos + diffusion).to(dtype)
+        return deterministic_next, stochastic_next
+
+    @torch.no_grad()
+    def step_backward(
+        self, data: DataType, time: torch.Tensor, dt: torch.Tensor
+    ) -> Tuple[DataType, DataType]:
+        dtype = data.pos.dtype
+        drift = (-self.sde.bwd_drift(time, data)) * (-dt)
+        diff_sq = self.sde.base_sde.diffsquare_integral(time) - self.sde.base_sde.diffsquare_integral(time - dt)
+        diffusion = diff_sq.sqrt() * self.sde.randn_like(data)
+        deterministic_prev = data.clone()
+        deterministic_prev.pos = (data.pos + drift).to(dtype)
+        stochastic_prev = data.clone()
+        stochastic_prev.pos = (deterministic_prev.pos + diffusion).to(dtype)
         return deterministic_prev, stochastic_prev

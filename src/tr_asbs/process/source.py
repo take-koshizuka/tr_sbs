@@ -12,6 +12,10 @@ import math
 from typing import Dict
 from torch.distributions import constraints
 
+from tr_asbs.data.atomic_data import ThermoAtomicData
+from tr_asbs.utils.composition import composition_to_atomic_numbers
+from tr_asbs.utils.geometry import is_mean_free_data
+
 class Prior(nn.Module, ABC):
     """
     Common interface for prior distributions.
@@ -300,3 +304,251 @@ class DeltaPrior(torch.distributions.Distribution, Prior):
         Shape: (n_samples, N, D)
         """
         return torch.zeros(n_samples, self.n_particles, self.spatial_dim, device=self.device)
+
+
+class HarmonicPrior(torch.distributions.Distribution, Prior):
+    """
+    Mean-free prior with a non-isotropic covariance coupling all particle
+    pairs by a harmonic spring, following the reference ASBS implementation
+    (facebookresearch/adjoint_samplers, CenteredParticlesHarmonic; see also
+    arXiv:2304.02198). Unlike MeanFreePrior (isotropic per-coordinate noise,
+    then mean-centered), this correlates particle positions so that samples
+    already resemble a loosely-connected cluster rather than an unstructured
+    cloud -- intended to reduce near-overlap configurations at the start of
+    training and thereby the importance-weight variance they cause.
+
+    Construction matches the reference exactly: A = 1.5*I - 0.5*J (J = all-
+    ones) is not PSD for n_particles > 3 (its "all-particles-translate-
+    together" eigenmode has a negative eigenvalue), so kron(A, I_d).inverse()
+    is not a valid covariance either. torch.svd of that (indefinite) matrix
+    still returns U, S >= 0 with cov ~= U @ diag(S) @ U.T only up to sign
+    flips on the negative-eigenvalue directions -- i.e. the actual sampling
+    distribution implicitly used by the reference code is the PSD matrix
+    U[:, :rank] @ diag(S[:rank]) @ U[:, :rank].T, not the nominal (indefinite)
+    one. log_prob is defined self-consistently with that same effective
+    covariance (required since it feeds the Girsanov/importance-weight
+    computation in integrator.run_with_logweights), not with the nominal one.
+    """
+    arg_constraints: Dict[str, constraints.Constraint] = {}
+
+    def __init__(self, n_particles: int, spatial_dim: int, scale: float = 1.0, device: str = "cpu"):
+        self.n_particles = n_particles
+        self.spatial_dim = spatial_dim
+        self._dim = n_particles * spatial_dim
+        self.device = device
+        self._scale = float(scale)
+
+        super().__init__(batch_shape=torch.Size(), event_shape=torch.Size([self._dim]))
+
+        self.k = (n_particles - 1) * spatial_dim  # effective (mean-free) degrees of freedom
+
+        # Raw (pre-centering) sampling covariance: full rank (dim, not k) --
+        # the SVD of the nominal (indefinite) matrix doesn't itself restrict to
+        # the mean-free subspace, that only happens via the explicit centering
+        # step in sample() below, exactly as in the reference implementation.
+        cov_nominal = self._compute_nominal_cov(n_particles, spatial_dim)
+        U_raw, S_raw, _ = torch.linalg.svd(cov_nominal)
+        self._A = (U_raw * S_raw.sqrt().unsqueeze(0)).to(device)  # (dim, dim), A @ A.T = U diag(S) U.T
+
+        # True covariance of the actual (post-centering) samples: P @ cov_raw @ P,
+        # where P is the same mean-centering projector as MeanFreePrior.cov.
+        # This is what log_prob must be self-consistent with (it feeds the
+        # Girsanov/importance-weight computation in integrator.run_with_logweights).
+        cov_raw_effective = U_raw @ torch.diag(S_raw) @ U_raw.T
+        I = torch.eye(n_particles)
+        J = torch.ones(n_particles, n_particles)
+        P_particle = I - J / n_particles
+        P = torch.kron(P_particle, torch.eye(spatial_dim))
+        cov_final = P @ cov_raw_effective @ P
+
+        eigvals, eigvecs = torch.linalg.eigh(cov_final)
+        # keep the k largest eigenvalues (rest are ~0, the centered-out translation modes)
+        order = torch.argsort(eigvals, descending=True)
+        self._U = eigvecs[:, order[: self.k]].to(device)   # (dim, k), orthonormal
+        self._S = eigvals[order[: self.k]].clamp(min=1e-12).to(device)  # (k,)
+
+    def _compute_nominal_cov(self, n_particles: int, spatial_dim: int) -> torch.Tensor:
+        A = -0.5 * torch.ones(n_particles, n_particles)
+        A[torch.arange(n_particles), torch.arange(n_particles)] = 1.0
+        B = torch.eye(spatial_dim)
+        return torch.kron(A, B).inverse()
+
+    @property
+    def dim(self) -> int:
+        return self._dim
+
+    @property
+    def scale(self) -> float:
+        return self._scale
+
+    @property
+    def cov(self) -> torch.Tensor:
+        # True covariance of the final (post-centering) samples.
+        return (self._scale ** 2) * (self._U @ torch.diag(self._S) @ self._U.T)
+
+    def sample(self, size: tuple) -> torch.Tensor:
+        if not isinstance(size, tuple):
+            size = (size,)
+        B = 1
+        for s in size:
+            B *= s
+        z = torch.randn(B, self._A.shape[1], device=self.device)
+        samples = z @ self._A.T  # (B, dim), raw (pre-centering) Cov = A @ A.T
+        samples = samples * self._scale
+        samples = samples.reshape(*size, self.n_particles, self.spatial_dim)
+        samples = samples - samples.mean(dim=-2, keepdim=True)
+        return samples.reshape(*size, self._dim)
+
+    def log_prob(self, x: torch.Tensor) -> torch.Tensor:
+        x_flat = x.reshape(-1, self._dim)
+        # Coordinates in the orthonormal mean-free eigenbasis of the TRUE
+        # (post-centering) covariance -- x is already mean-free, i.e. in the
+        # span of self._U, so this is a lossless, isometric reparametrization
+        # (no Jacobian correction needed).
+        y = x_flat @ self._U  # (B, k)
+        var = (self._scale ** 2) * self._S  # (k,)
+        quad = (y ** 2 / var).sum(dim=-1)
+        log_norm = 0.5 * self.k * math.log(2.0 * math.pi) + 0.5 * torch.log(var).sum()
+        log_px = -0.5 * quad - log_norm
+        return log_px.reshape(x.shape[:-1]) if x.dim() > 1 else log_px.squeeze()
+
+
+class BaseSource(nn.Module, ABC):
+    """Base class for sampling random atomic data (graph-batch representation,
+    used by the Ala2/OpenMM+PaiNN pipeline -- see GaussianSource below).
+    """
+
+    def __init__(
+        self,
+        pbc: list = [False, False, False],
+        cell=None,
+        composition: str = None,
+        num_atoms: int = None,
+        temperature: float = 1.0,
+        charge: int = 0,
+        spin: int = 1,
+        center: bool = True,
+    ):
+        if not ((num_atoms is None) ^ (composition is None)):
+            raise ValueError(
+                "Exactly one of num_particles or composition must be provided."
+            )
+
+        super().__init__()
+        self.register_buffer("pbc", torch.as_tensor(pbc, dtype=torch.bool))
+        if cell is None:
+            cell = torch.zeros(3, 3, dtype=torch.float)
+        self.register_buffer("cell", torch.as_tensor(cell, dtype=torch.float))
+        if composition is not None:
+            atomic_numbers = composition_to_atomic_numbers(composition)
+            num_atoms = len(atomic_numbers)
+        else:
+            atomic_numbers = [0] * num_atoms  # Default to zero for unspecified
+        self.register_buffer(
+            "atomic_numbers", torch.as_tensor(atomic_numbers, dtype=torch.long)
+        )
+        self.num_atoms = num_atoms
+        self.register_buffer(
+            "temperature", torch.as_tensor(temperature, dtype=torch.float)
+        )
+        if charge is None:
+            charge = torch.zeros(num_atoms, dtype=torch.long)
+        self.register_buffer("charge", torch.as_tensor(charge, dtype=torch.long))
+        if spin is None:
+            spin = torch.ones(num_atoms, dtype=torch.long)
+        self.register_buffer("spin", torch.as_tensor(spin, dtype=torch.long))
+        self.center = center
+
+    @abstractmethod
+    def sample_single_data(self) -> ThermoAtomicData:
+        """Sample a single atomic data instance."""
+
+    def sample(self, shape) -> ThermoAtomicData:
+        """Sample a batch of random atomic data."""
+        if isinstance(shape, tuple):
+            if len(shape) != 1:
+                raise ValueError("Shape must be a single integer for batch size.")
+            shape = shape[0]
+        data_list = [self.sample_single_data() for _ in range(shape)]
+        data = ThermoAtomicData.from_data_list(data_list)
+        if self.center and not is_mean_free_data(data):
+            raise ValueError("Sampled data is not mean-free.")
+        return data
+
+    def replicate_sample(self, shape, num_repeats: int) -> ThermoAtomicData:
+        """Sample a batch and replicate each sample num_repeats times."""
+        data = self.sample(shape)
+        repeated = []
+        for graph_data in data.batch_to_atomicdata_list():
+            repeated.extend([graph_data.clone() for _ in range(num_repeats)])
+        return ThermoAtomicData.from_data_list(repeated).to(data.pos.device)
+
+    def log_prob(self, data: ThermoAtomicData) -> torch.Tensor:
+        raise NotImplementedError(f"{self.__class__.__name__} does not implement log_prob.")
+
+
+class GaussianSource(BaseSource):
+    """Isotropic Gaussian prior over atomic positions (graph-batch
+    representation). Counterpart of GaussianPrior above, for the Ala2/
+    OpenMM+PaiNN atomic pipeline.
+    """
+
+    def __init__(
+        self,
+        pbc: list = [False, False, False],
+        cell=None,
+        composition: str = None,
+        num_atoms: int = None,
+        temperature: float = 1.0,
+        charge: int = 0,
+        spin: int = 1,
+        scale: float = 1.0,
+        center: bool = True,
+    ):
+        super().__init__(
+            pbc=pbc,
+            cell=cell,
+            composition=composition,
+            num_atoms=num_atoms,
+            temperature=temperature,
+            charge=charge,
+            spin=spin,
+            center=center,
+        )
+        self.register_buffer("scale", torch.as_tensor(scale, dtype=torch.float))
+
+    def sample_single_data(self) -> ThermoAtomicData:
+        pos = torch.randn(self.num_atoms, 3, dtype=torch.float, device=self.cell.device)
+        pos = pos * self.scale
+        if self.center:
+            pos -= pos.mean(dim=0, keepdim=True)
+        return ThermoAtomicData.from_geometry(
+            pos=pos,
+            atomic_numbers=self.atomic_numbers,
+            cell=self.cell.unsqueeze(0),
+            pbc=self.pbc.unsqueeze(0),
+            temperature=self.temperature.unsqueeze(0),
+            charge=self.charge.unsqueeze(0),
+            spin=self.spin.unsqueeze(0),
+        ).to(self.cell.device)
+
+    def log_prob(self, data: ThermoAtomicData) -> torch.Tensor:
+        # Independent isotropic Gaussian prior over all coordinates in each graph.
+        sigma = self.scale.to(data.pos).clamp(min=1e-12)
+        two_pi = torch.tensor(2 * torch.pi, device=data.pos.device, dtype=data.pos.dtype)
+        out = []
+        for graph_data in data.batch_to_atomicdata_list():
+            x = graph_data.pos.reshape(-1)
+            dim = x.numel()
+            # Effective degrees of freedom for the normalization constant:
+            # when self.center=True (the sampled/scored distribution only
+            # ever occupies the mean-free subspace -- COM removal cuts
+            # exactly `spatial_dim` dof regardless of atom count), matching
+            # MeanFreePrior's k = (n_particles - 1) * spatial_dim convention
+            # elsewhere in this file. Using the full ambient `dim` here would
+            # add a fixed, non-cancelling bias to every log_prob call.
+            k = dim - graph_data.pos.shape[-1] if self.center else dim
+            quad = (x / sigma).pow(2).sum()
+            log_det = k * torch.log(sigma)
+            out.append(-0.5 * (quad + k * torch.log(two_pi) + 2 * log_det))
+        return torch.stack(out, dim=0)

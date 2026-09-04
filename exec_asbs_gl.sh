@@ -11,7 +11,7 @@ set -euo pipefail
 
 source ~/.profile
 cd /home/htc/tkoshizuka/tr_asbs
-RUN_ROOT="${PWD}/runs"
+RUN_ROOT="/home/htc/lrichter/SCRATCH/tr_asbs_data/runs"
 mkdir -p "${RUN_ROOT}"
 
 uv run python -u -m tr_asbs.experiment.train_asbs \

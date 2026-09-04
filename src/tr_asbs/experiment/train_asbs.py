@@ -604,13 +604,18 @@ class ASBSModule:
     ############################################################################
 
     def load_pretrained_controller_checkpoint(self):
-        """Load a pretrained controller checkpoint if specified in the config."""
+        """Load a pretrained controller (+ corrector, if present in the
+        checkpoint) checkpoint if specified in the config. Used to warm-start
+        plain-ASBS training from a gamma_asbs_iw checkpoint (CE/log-variance +
+        trust-region), i.e. the reverse curriculum direction -- IW/TR first,
+        then finish with plain MSE adjoint-matching -- mirroring the same fix
+        made in train_gamma_asbs_iw.py for the forward direction."""
         checkpoint_path = Path(self.cfg.pretrained_controller_checkpoint)
         if not checkpoint_path.exists():
             raise FileNotFoundError(
                 f"Pretrained controller checkpoint not found: {checkpoint_path}"
             )
-        state = {"controller": self.controller}
+        state = {"controller": self.controller, "corrector": self.corrector}
         self.fabric.load(checkpoint_path, state)
 
     def load_checkpoint(self):
@@ -795,8 +800,6 @@ def main(cfg: DictConfig) -> None:
     if use_wandb_logger:
         os.environ["WANDB_MODE"] = str(cfg.wandb_mode)
         os.environ["WANDB_BASE_URL"] = str(cfg.wandb_host)
-        os.environ["WANDB_API_KEY"] = str(cfg.wandb_key)
-        wandb.login(key=os.environ["WANDB_API_KEY"], relogin=True)
     # NOTE: changing matmul precision may result in mean drift
     torch.set_float32_matmul_precision("high")
     trainer = ASBSModule(cfg)

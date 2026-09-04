@@ -1,0 +1,156 @@
+# @package _global_
+#
+# LJ-13, cross-entropy FC loss, ANNEALED SOFT-CORE potential variant --
+# identical to lj13_ce_fast_softcore.yaml except softcore_alpha is no longer
+# fixed: it starts very soft (softcore_alpha_start=1.0, safe/smooth-gradient
+# exploration while the cold-started policy is still far from equilibrium)
+# and anneals LINEARLY down to softcore_alpha_end=0.0 (the exact, true LJ
+# potential) over the first softcore_alpha_anneal_epochs=2000 epochs, then
+# holds there. Motivation: softcore_alpha=0.01 (fixed) already leaves the
+# well region essentially untouched (<0.002 perturbation) while taming the
+# near-overlap blowup -- annealing lets training start even MORE softened
+# (alpha=1.0 caps the r=0 energy at just 80, vs alpha=0.01's ~9800) during the
+# hardest, most divergence-prone early phase, then removes the softening
+# entirely once the policy has (hopefully) learned to avoid overlaps on its
+# own, recovering the exact target distribution and exact Eq-EMD2 comparability
+# to every other LJ-13 run by the time softcore_alpha reaches 0.
+# See lennardjones_energy.py's LennardJonesEnergy.update_epoch for the
+# schedule implementation and train_gamma_asbs_iw.py's per-epoch hook.
+
+name: lj13_egnn_ce_softcore_anneal_tr_asbs
+fabric:
+  loggers:
+    tags: [lj13, egnn, cross_entropy, softcore_anneal]
+
+seed: 0
+compile: false
+
+################################################################################
+# Potentials
+################################################################################
+potential:
+  _target_: tr_asbs.potential.lennardjones_energy.LennardJonesEnergy
+  n_particles: 13
+  spatial_dim: 3
+  ref_samples_path: "./data/test_split_LJ13-1000.npy"
+  energy_clip: 10000.0
+  softcore_alpha_start: 1.0
+  softcore_alpha_end: 0.0
+  softcore_alpha_anneal_epochs: 2000
+
+################################################################################
+# Settings for Gamma
+################################################################################
+gamma: 1.0
+gamma_schedule: trust_region
+trust_region_bound: 0.2
+iw_clip_value: 5.0
+
+# Default cross-entropy (importance-weighted forward-KL) FC loss.
+fc_loss_mode: cross_entropy
+
+################################################################################
+# Training settings
+################################################################################
+max_outer_loops: 2000 # effectively unbounded given the SLURM time limit; run until killed
+adjoint_matching_epochs: 200
+corrector_matching_epochs: 50
+steps_per_epoch: 100
+train_batch_size: 200
+inference_batch_size: 1000
+num_samples_for_dual_loss: [500, 20]
+
+################################################################################
+# Logging
+################################################################################
+log_detail_interval_epoch: 25
+monitor_values: ["loss/Eq-EMD2", "loss/neg_avg_energy"]
+
+################################################################################
+# Models
+################################################################################
+controller:
+  _target_: tr_asbs.model.egnn.EGNN_dynamics
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  n_layers: 3
+  hidden_nf: 64
+  attention: false
+  agg: sum
+  compile: ${compile}
+  clip_norm: 100.0
+
+corrector:
+  _target_: tr_asbs.model.egnn.EGNN_dynamics
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  n_layers: 3
+  hidden_nf: 64
+  attention: false
+  agg: sum
+  compile: ${compile}
+  clip_norm: 100.0
+
+################################################################################
+# Optimization
+################################################################################
+controller_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+corrector_optimizer:
+  _target_: torch.optim.Adam
+  lr: 1e-4
+  weight_decay: 0.0
+
+gradient_clip_val: 100.0
+loss_1_weight: 1.0
+
+################################################################################
+# Buffers
+################################################################################
+adjoint_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+corrector_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 50000
+
+initial_buffer_samples: 1000
+buffer_samples_per_epoch: 1000
+log_buffer_energy: true
+log_buffer_grad_norm: true
+
+################################################################################
+# Process and integration
+################################################################################
+source:
+  _target_: tr_asbs.process.source.MeanFreePrior
+  n_particles: ${potential.n_particles}
+  spatial_dim: ${potential.spatial_dim}
+  scale: 2.0
+
+base_sde:
+  _target_: tr_asbs.process.sde.VESDE
+  sigma_min: 0.001
+  sigma_max: 0.5
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 200
+    rescale_t: null
+
+################################################################################
+# Terminal cost
+################################################################################
+terminal_cost:
+  _target_: tr_asbs.process.terminal_cost.ASBSTerminalCost
+  grad_clip_val: 100.0
+
+E_max: 10000

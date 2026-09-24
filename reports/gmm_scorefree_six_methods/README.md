@@ -10,7 +10,7 @@ sliced W2 are better; larger raw path ESS is better.
 
 | Suite | Values | Fixed counterpart | Methods |
 | --- | --- | --- | --- |
-| mode | K = 5, 10, 20, 30, 40 | d = 10 | ASBS, Gamma-ASBS, IW fixed, IW TR, PIS, DIS |
+| mode | K = 5, 10, 20, 30, 40 | d = 10 | ASBS, TR-ASBS, ASBS-IW, TR-SBS, PIS, DIS |
 | dim | d = 10, 25, 50, 100 | K = 10 | Same six methods |
 
 PIS and DIS use `ASBSFourierControl`, which inherits the ASBS `FourierMLP`
@@ -23,9 +23,11 @@ figures compare the completed experiments; they do not claim equal total
 compute.
 
 The colors and markers follow `tr_asbs_wandb/make_plot.py` where that program
-fixes them: ASBS blue/circle, IW fixed orange/square, IW TR red/diamond.
-Gamma-ASBS, PIS, and DIS use distinct tab10 colors and markers. SD and raw
-path ESS use logarithmic y axes; if a lower error bar would cross zero, the
+fixes them: ASBS blue/circle, ASBS-IW orange/square, TR-SBS red/diamond.
+TR-ASBS, PIS, and DIS use distinct tab10 colors and markers. The plot labels
+TR-ASBS, ASBS-IW, and TR-SBS correspond to the stored method keys
+`gamma_asbs`, `gamma_asbs_iw_fixed`, and `gamma_asbs_iw_trust_region_*`.
+SD and raw path ESS use logarithmic y axes; if a lower error bar would cross zero, the
 displayed lower endpoint is clipped to the smallest positive value. Means and
 sample standard deviations in the CSVs are unchanged.
 
@@ -38,7 +40,10 @@ From the repository root:
 ```
 
 The script requires Matplotlib and writes five metric plots for each suite as
-PDF and PNG under `figures/min_online_sd/`. To inspect stability or ESS-based
+PDF and PNG under `figures/min_online_sd/` (boxed legend) and
+`figures/min_online_sd/legend_no_box/` (frameless legend). Both legends are
+placed inside the axes. SD/TVD panels use compact layouts in open bands where a
+lower-right legend would obscure TR-SBS. To inspect stability or ESS-based
 selection, pass `--selection final` or `--selection max_online_raw_ess`.
 
 ## Frozen input provenance

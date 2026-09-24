@@ -29,9 +29,9 @@ SELECTIONS = ("min_online_sd", "max_online_raw_ess", "final")
 # IW TR red/diamond.  The remaining colors and markers are distinct tab10.
 METHODS = {
     "asbs": ("ASBS", "tab:blue", "o"),
-    "gamma_asbs": ("Gamma-ASBS", "tab:green", "^"),
-    "iw_fixed": ("IW fixed", "tab:orange", "s"),
-    "iw_tr": ("IW TR", "tab:red", "D"),
+    "gamma_asbs": ("TR-ASBS", "tab:green", "^"),
+    "iw_fixed": ("ASBS-IW", "tab:orange", "s"),
+    "iw_tr": ("TR-SBS", "tab:red", "D"),
     "pis": ("PIS", "tab:purple", "P"),
     "dis": ("DIS", "tab:brown", "X"),
 }
@@ -167,13 +167,36 @@ def plot_one(
         ax.set_yscale("log")
     if metric == "TVD":
         ax.set_ylim(bottom=0, top=1.02)
-    ax.legend(frameon=True, framealpha=0.9, edgecolor="gray", fancybox=False,
-              ncol=2, loc="upper center", bbox_to_anchor=(0.5, -0.20))
+    # The main SD/TVD panels have an open band between the methods. Use a
+    # shorter three-column legend there so it does not cover the low TR-SBS
+    # curve; use Matplotlib's data-aware placement for the other panels.
+    interior_positions = {
+        ("mode", "SD"): (0.5, 0.72),
+        ("mode", "TVD"): (0.5, 0.76),
+        ("dim", "TVD"): (0.28, 0.77),
+    }
+    interior = interior_positions.get((suite, metric))
+    legend_options = dict(frameon=True, framealpha=0.9, edgecolor="gray",
+                          fancybox=False, ncol=3 if interior else 2,
+                          loc="center" if interior else "best",
+                          bbox_to_anchor=interior)
+    if (suite, metric) == ("dim", "TVD"):
+        # The gap is narrower here, so make the legend taller but less wide.
+        legend_options.update(ncol=2, fontsize=12, labelspacing=0.25,
+                              borderpad=0.3, handletextpad=0.3,
+                              columnspacing=0.8)
+    legend = ax.legend(**legend_options)
     fig.tight_layout()
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = output_dir / f"GMM_{suite}_{metric}"
     fig.savefig(stem.with_suffix(".pdf"))
     fig.savefig(stem.with_suffix(".png"))
+    legend.set_frame_on(False)
+    frameless_dir = output_dir / "legend_no_box"
+    frameless_dir.mkdir(parents=True, exist_ok=True)
+    frameless_stem = frameless_dir / stem.name
+    fig.savefig(frameless_stem.with_suffix(".pdf"))
+    fig.savefig(frameless_stem.with_suffix(".png"))
     plt.close(fig)
 
 
@@ -188,7 +211,8 @@ def main() -> None:
         result = load_grid(args.data_dir, suite, args.selection)
         for metric in METRICS:
             plot_one(result, suite, metric, args.output_dir / args.selection)
-    print(f"Saved {len(GRIDS) * len(METRICS)} PDF/PNG figure pairs in {args.output_dir / args.selection}")
+    print(f"Saved {len(GRIDS) * len(METRICS)} boxed and frameless PDF/PNG figure pairs "
+          f"in {args.output_dir / args.selection}")
 
 
 if __name__ == "__main__":

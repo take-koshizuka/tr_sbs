@@ -173,6 +173,7 @@ def plot_one(
     interior_positions = {
         ("mode", "SD"): (0.5, 0.72),
         ("mode", "TVD"): (0.5, 0.76),
+        ("mode", "W2"): (0.55, 0.69),
         ("dim", "TVD"): (0.28, 0.77),
     }
     interior = interior_positions.get((suite, metric))

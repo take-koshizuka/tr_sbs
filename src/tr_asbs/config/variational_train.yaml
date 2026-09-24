@@ -1,0 +1,84 @@
+# @package _global_
+defaults:
+  - _self_
+  - experiment: mw5
+  - algorithm: pis
+
+# Experiment configs continue to define the potential, diffusion bounds, batch
+# size and target-specific monitor values. This entrypoint does not instantiate
+# source or base_sde; algorithm configs selectively reuse their scalar values.
+root: ${oc.env:TR_ASBS_ROOT,.}
+seed: 0
+name: variational
+run_name: ${name}_${algorithm.name}
+
+dtype: float32
+resume_from: null
+compile_control: false
+compile_options: {}
+# Target figures are produced at every evaluation. The 150 training-time
+# evaluations plus the initial evaluation match the current 30,000-epoch GMM
+# ASBS schedule evaluated every 200 epochs plus its final evaluation.
+visualize: true
+
+progress_bar: true
+log_interval: 50
+eval_samples: 2000
+eval_samples_final: 4000
+inference_batch_size: 10000
+monitor_values: []
+monitor_initial_state: true
+
+# Use the same opt-in compute guard as the ASBS trainers. It stops only after
+# sustained joint degradation and never selects the reported checkpoint.
+divergence_early_stop:
+  enabled: false
+  primary_metric: loss/SD
+  secondary_metric: loss/tvd_soft
+  min_evals: 20
+  primary_factor: 2.0
+  secondary_delta: 0.15
+  patience: 8
+  nonfinite_patience: 2
+
+evaluation:
+  num_evaluations: 150
+  num_samples: ${eval_samples}
+  chunk_size: ${inference_batch_size}
+  include_target_details: true
+  evaluate_initial_state: true
+  report_checkpoints: true
+  final_num_samples: ${eval_samples_final}
+  report_seed: 12345
+
+checkpoint:
+  directory: ${hydra:runtime.output_dir}/checkpoints
+  interval: 5000
+  mode: min
+
+fabric:
+  _target_: lightning.fabric.Fabric
+  accelerator: auto
+  strategy: auto
+  devices: 1
+  num_nodes: 1
+  precision: 32-true
+  loggers:
+    _target_: wandb.integration.lightning.fabric.WandbLogger
+    name: ${run_name}
+    entity: ml-takeshi-work
+    project: tr_asbs
+    tags: ["${algorithm.name}"]
+    save_dir: ${hydra:runtime.output_dir}
+    group: null
+    log_model: false
+
+wandb_mode: online
+wandb_host: https://api.wandb.ai
+
+hydra:
+  run:
+    dir: ${root}/outputs/variational/${run_name}/${now:%Y-%m-%d_%H-%M-%S}
+  sweep:
+    dir: ${root}/outputs/variational/multirun/${run_name}/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${hydra.job.num}

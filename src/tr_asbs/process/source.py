@@ -3,18 +3,32 @@
 #
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+
+from __future__ import annotations
+
 import abc
 from abc import ABC, abstractmethod
+from functools import lru_cache
 
 import torch
 import torch.nn as nn
 import math
-from typing import Dict
+from typing import Dict, TYPE_CHECKING
 from torch.distributions import constraints
 
-from tr_asbs.data.atomic_data import ThermoAtomicData
 from tr_asbs.utils.composition import composition_to_atomic_numbers
 from tr_asbs.utils.geometry import is_mean_free_data
+
+if TYPE_CHECKING:
+    from tr_asbs.data.atomic_data import ThermoAtomicData
+
+
+@lru_cache(maxsize=1)
+def _thermo_atomic_data_type():
+    """Import the optional atomistic data type only for atomic sources."""
+    from tr_asbs.data.atomic_data import ThermoAtomicData
+
+    return ThermoAtomicData
 
 class Prior(nn.Module, ABC):
     """
@@ -470,7 +484,7 @@ class BaseSource(nn.Module, ABC):
                 raise ValueError("Shape must be a single integer for batch size.")
             shape = shape[0]
         data_list = [self.sample_single_data() for _ in range(shape)]
-        data = ThermoAtomicData.from_data_list(data_list)
+        data = _thermo_atomic_data_type().from_data_list(data_list)
         if self.center and not is_mean_free_data(data):
             raise ValueError("Sampled data is not mean-free.")
         return data
@@ -481,7 +495,7 @@ class BaseSource(nn.Module, ABC):
         repeated = []
         for graph_data in data.batch_to_atomicdata_list():
             repeated.extend([graph_data.clone() for _ in range(num_repeats)])
-        return ThermoAtomicData.from_data_list(repeated).to(data.pos.device)
+        return _thermo_atomic_data_type().from_data_list(repeated).to(data.pos.device)
 
     def log_prob(self, data: ThermoAtomicData) -> torch.Tensor:
         raise NotImplementedError(f"{self.__class__.__name__} does not implement log_prob.")
@@ -522,7 +536,7 @@ class GaussianSource(BaseSource):
         pos = pos * self.scale
         if self.center:
             pos -= pos.mean(dim=0, keepdim=True)
-        return ThermoAtomicData.from_geometry(
+        return _thermo_atomic_data_type().from_geometry(
             pos=pos,
             atomic_numbers=self.atomic_numbers,
             cell=self.cell.unsqueeze(0),

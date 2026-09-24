@@ -23,14 +23,15 @@ from scipy.optimize import minimize_scalar
 import json
 import hashlib
 import uuid
+from typing import Any
 
 from omegaconf import OmegaConf
 
 from tr_asbs.process.sde import ControlledSDE, ControlledFBSDE
 from tr_asbs.utils.training import EMA, copy_model
 from tr_asbs.data.buffer import BatchBuffer
-from tr_asbs.utils.eval_logweight import compute_reverse_ess, normalize_log_weights
-from tr_asbs.utils.helper import Checkpointer, CheckpointConfig
+from tr_asbs.utils.eval_logweight import compute_raw_path_ess, compute_reverse_ess, normalize_log_weights
+from tr_asbs.utils.helper import Checkpointer, CheckpointConfig, JointMetricDivergenceStopper
 
 import time
 import torch._dynamo
@@ -211,6 +212,10 @@ class GammaASBSModule:
             # Models
             controller = hydra.utils.instantiate(cfg.controller)
             corrector = hydra.utils.instantiate(cfg.corrector)
+            for model in (controller, corrector):
+                set_potential = getattr(model, "set_potential", None)
+                if callable(set_potential):
+                    set_potential(self.potential)
             if cfg.ema_decay is not None:
                 self.controller = EMA(controller, cfg.ema_decay, cfg.ema_start_step)
                 self.corrector = EMA(corrector, cfg.ema_decay, cfg.ema_start_step)
@@ -310,6 +315,26 @@ class GammaASBSModule:
         
         self.zeros_tensor = self.fabric.to_device(torch.zeros(self.cfg.train_batch_size))
         self.ones_tensor = self.fabric.to_device(torch.ones(self.cfg.train_batch_size))
+        self.divergence_stopper = JointMetricDivergenceStopper(self.cfg.divergence_early_stop)
+        self.early_stop_requested = False
+
+        self.model_capacity = {
+            "forward_controller_parameters": sum(
+                parameter.numel() for parameter in self.controller.parameters()
+            ),
+            "corrector_parameters": sum(
+                parameter.numel() for parameter in self.corrector.parameters()
+            ),
+            "total_trainable_parameters": sum(
+                parameter.numel()
+                for model in (self.controller, self.corrector)
+                for parameter in model.parameters()
+            ),
+            "integration_steps": int(len(self.integrator.timesteps) - 1),
+        }
+        if self.fabric.global_rank == 0 and wandb.run is not None:
+            for name, value in self.model_capacity.items():
+                wandb.run.summary[f"capacity/{name}"] = int(value)
         
         ############################################################################
         self.ckpts = {}
@@ -322,7 +347,7 @@ class GammaASBSModule:
                     enable=True,
                     checkpoint_dir=self.checkpoint_directory,
                     filename_fmt="{tag}.pt",
-                    mode="min",                 # loss なら "min"
+                    mode=str(self.cfg.monitor_modes.get(name, "min")),
                 ),
                 make_payload=lambda: {
                     "fbsde": self.sde.state_dict(),
@@ -337,6 +362,17 @@ class GammaASBSModule:
     def lm(self) -> float:
         """lagrangian multiplier expressed from gamma. Kept for compatibility."""
         return (1 - self.gamma) / self.gamma
+
+    def _update_divergence_early_stop(self, metrics):
+        eval_index = self.current_epoch // self.cfg.log_detail_interval_epoch
+        if not self.divergence_stopper.update(metrics, eval_index):
+            return
+        self.early_stop_requested = True
+        print(f"Early stopping at epoch {self.current_epoch}: {self.divergence_stopper.reason}")
+        if wandb.run is not None:
+            wandb.run.summary["early_stop/triggered"] = True
+            wandb.run.summary["early_stop/epoch"] = int(self.current_epoch)
+            wandb.run.summary["early_stop/reason"] = self.divergence_stopper.reason
     
     def inner_loop_u(self):
         current_task = "adjoint_matching"
@@ -379,10 +415,13 @@ class GammaASBSModule:
                         value=metrics[name],
                         step=self.current_epoch // self.cfg.log_detail_interval_epoch,
                         tag_best=f"{name_safe}_best",          # ファイル名 "{tag}.pt" なので "best.pt" になる
-                        extra_status={"eval_step": metrics["eval_step"]},
+                        extra_status={"eval_step": metrics["eval_step"], "epoch": metrics["epoch"]},
                     )
+                self._update_divergence_early_stop(metrics)
                 del metrics
                 torch.cuda.empty_cache()
+                if self.early_stop_requested:
+                    break
             
     def inner_loop_h(self):
         current_task = "corrector_matching"
@@ -422,10 +461,13 @@ class GammaASBSModule:
                         value=metrics[name],
                         step=self.current_epoch // self.cfg.log_detail_interval_epoch,
                         tag_best=f"{name_safe}_best",          # ファイル名 "{tag}.pt" なので "best.pt" になる
-                        extra_status={"eval_step": metrics["eval_step"]},
+                        extra_status={"eval_step": metrics["eval_step"], "epoch": metrics["epoch"]},
                     )
+                self._update_divergence_early_stop(metrics)
                 del metrics
                 torch.cuda.empty_cache()
+                if self.early_stop_requested:
+                    break
     ############################################################################
     # Training loop structure
     ############################################################################
@@ -445,13 +487,16 @@ class GammaASBSModule:
             
         metrics = self.log_details(0)
         for name in self.cfg.monitor_values:
+            if not self.cfg.monitor_initial_state:
+                continue
             name_safe = name.replace("/", "_")
             info = self.ckpts[name_safe].update(
                 value=metrics[name],
                 step=self.current_epoch // self.cfg.log_detail_interval_epoch,
                 tag_best=f"{name_safe}_best",          # ファイル名 "{tag}.pt" なので "best.pt" になる
-                extra_status={"eval_step": metrics["eval_step"]},
+                extra_status={"eval_step": metrics["eval_step"], "epoch": metrics["epoch"]},
             )
+        self._update_divergence_early_stop(metrics)
 
         for outer_step in range(self.max_outer_loops):
             if self.gamma_schedule == "trust_region":
@@ -471,7 +516,11 @@ class GammaASBSModule:
                 # sample, silently turning "importance weighting" into a no-op).
                 self.V0 = self.compute_V0_for_fixed_gamma()
             self.inner_loop_u()
+            if self.early_stop_requested:
+                break
             self.inner_loop_h()
+            if self.early_stop_requested:
+                break
 
         self.save_checkpoint()
         self.log_final()
@@ -1192,12 +1241,12 @@ class GammaASBSModule:
             progress_bar=(self.fabric.global_rank == 0) and self.cfg.progress_bar,
         )
         results = {
-            "data_0": data_0[:self.cfg.eval_samples].detach().cpu(),
-            "data_1": integral_results['data_1'][:self.cfg.eval_samples].detach().cpu(),
-            "log_Ph_Pref": integral_results['log_Ph_Pref'][:self.cfg.eval_samples].detach().cpu(),
-            "log_Pu_Pref": integral_results['log_Pu_Pref'][:self.cfg.eval_samples].detach().cpu(),
-            'log_RN[u_next|u]_eff': integral_results['log_Pref_Pu_det'][:self.cfg.eval_samples].detach().cpu(),
-            'log_RN[u_next|u]': -integral_results['log_Pu_Pref'][:self.cfg.eval_samples].detach().cpu(),
+            "data_0": data_0[:eval_samples].detach().cpu(),
+            "data_1": integral_results['data_1'][:eval_samples].detach().cpu(),
+            "log_Ph_Pref": integral_results['log_Ph_Pref'][:eval_samples].detach().cpu(),
+            "log_Pu_Pref": integral_results['log_Pu_Pref'][:eval_samples].detach().cpu(),
+            'log_RN[u_next|u]_eff': integral_results['log_Pref_Pu_det'][:eval_samples].detach().cpu(),
+            'log_RN[u_next|u]': -integral_results['log_Pu_Pref'][:eval_samples].detach().cpu(),
             'predict_drift_fn': self.sde.drift,
         }
         
@@ -1243,6 +1292,7 @@ class GammaASBSModule:
                     progress_bar=(self.fabric.global_rank == 0) and self.cfg.progress_bar,
                 )
                 logs["figures/data_0_hat"] = self.potential.visualize_raw(data_0_hat, title="data_0_hat")
+        logs["eval/raw_path_ess"] = compute_raw_path_ess(results["log_Ph_Pref"])
         
         logs["epoch"] = self.current_epoch
         logs["eval_step"] = step
@@ -1328,53 +1378,122 @@ class GammaASBSModule:
             self._save_weight_rollback_checkpoint()
 
     def log_final(self):
-        final_logs = self.log_details(self.current_epoch // self.cfg.log_detail_interval_epoch, visualize=True, eval_samples=self.cfg.eval_samples * 2)
-        data_0, data_1 = final_logs.pop("data_0"), final_logs.pop("data_1")
-        self.save_final_samples(data_0, data_1, name=f"last_epoch")
-        # rank0だけ summary に確定値を書き込む
-        if self.fabric.global_rank == 0 and wandb.run is not None:
-            wandb.run.summary["seed"] = int(self.cfg.seed)
-            for key, value in final_logs.items():
-                wandb.run.summary[f"final/{key}"] = value
-            wandb.run.summary["final/epoch"] = int(self.current_epoch)
-            wandb.run.summary["final/global_step"] = int(self.global_step)
+        report_seed = int(getattr(self.cfg, "report_seed", 12345))
+        final_epoch = int(self.current_epoch)
+        final_global_step = int(self.global_step)
+        final_state = deepcopy(self.sde.state_dict())
+        cpu_rng_state = torch.get_rng_state()
+        cuda_rng_state = (
+            torch.cuda.get_rng_state_all() if torch.cuda.is_available() else []
+        )
+        report: dict[str, Any] = {
+            "algorithm": "score_conditioned_tr_iw",
+            "seed": int(self.cfg.seed),
+            "final_epoch": final_epoch,
+            "final_global_step": final_global_step,
+            "early_stopped": bool(self.early_stop_requested),
+            "early_stop_reason": self.divergence_stopper.reason,
+            "capacity": self.model_capacity,
+            "selections": {},
+        }
 
-        for name in self.ckpts.keys():
-            ckpt_path = Path(self.checkpoint_directory) / f"{name}_best.pt"
-            ckpt = torch.load(ckpt_path, map_location="cpu")
-            info = ckpt["_checkpoint"]
-            step = info["status"]["step"]
-            best_val = info["status"]["value"]
-            self.sde.load_state_dict(ckpt["fbsde"])
+        def scalar_metrics(logs: dict[str, Any]) -> dict[str, float]:
+            metrics: dict[str, float] = {}
+            for key, value in logs.items():
+                if isinstance(value, (int, float, np.number)):
+                    metrics[key] = float(value)
+                elif torch.is_tensor(value) and value.numel() == 1:
+                    metrics[key] = float(value.detach().cpu())
+            return metrics
+
+        def reset_report_rng() -> None:
+            torch.manual_seed(report_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(report_seed)
+
+        def evaluate_loaded_state(
+            selection: str,
+            selected_epoch: int,
+            monitor_metric: str | None,
+            online_value: float | None,
+        ) -> dict[str, Any]:
+            reset_report_rng()
             self.sde.eval()
-            
             integrator = hydra.utils.instantiate(self.cfg.integrator, sde=self.sde)
-            data_0 = self.source.sample((self.cfg.eval_samples * 2,))
-            data_1 = integrator.run(
+            data_0 = self.source.sample((self.cfg.eval_samples_final,))
+            integral_results = integrator.run_with_logweights(
+                integrator=integrator,
+                prior_log_prob_fn=self.source.log_prob,
+                target_log_prob_fn=self.potential.log_prob,
                 initial_data=data_0,
                 center_every_step=self.potential.is_mean_free,
                 zero_last_step_noise=False,
                 return_trajectory=False,
                 progress_bar=(self.fabric.global_rank == 0) and self.cfg.progress_bar,
             )
-            self.save_final_samples(data_0, data_1, name=f"best_{name}")
+            data_1 = integral_results["data_1"]
+            self.save_final_samples(data_0, data_1, name=selection)
             results = {
-                "data_0": data_0[:self.cfg.eval_samples],
-                "data_1": data_1[:self.cfg.eval_samples]
+                "data_0": data_0,
+                "data_1": data_1,
+                "log_Ph_Pref": integral_results["log_Ph_Pref"],
             }
-            
             logs = self.potential.log_details(results, visualize=True)
-            
+            logs["eval/raw_path_ess"] = compute_raw_path_ess(
+                results["log_Ph_Pref"]
+            )
+            metrics = scalar_metrics(logs)
             if self.fabric.global_rank == 0 and wandb.run is not None:
                 for key, value in logs.items():
-                    wandb.run.summary[f"best_{name}/{key}"] = value
-                wandb.run.summary[f"best_{name}/step"] = int(step)
-                wandb.run.summary[f"best_{name}/value"] = float(best_val)
-            
-            # ===== checkpoint 削除 =====
-            if self.fabric.global_rank == 0:
-                ckpt_path.unlink(missing_ok=True)
-             
+                    wandb.run.summary[f"report/{selection}/{key}"] = value
+                wandb.run.summary[f"report/{selection}/epoch"] = selected_epoch
+            return {
+                "selected_epoch": selected_epoch,
+                "online_selection_metric": monitor_metric,
+                "online_selection_value": online_value,
+                "num_samples": int(self.cfg.eval_samples_final),
+                "report_seed": report_seed,
+                "metrics": metrics,
+            }
+
+        try:
+            report["selections"]["final"] = evaluate_loaded_state(
+                "final", final_epoch, None, None
+            )
+            for name in self.ckpts.keys():
+                ckpt_path = Path(self.checkpoint_directory) / f"{name}_best.pt"
+                if not ckpt_path.is_file():
+                    raise FileNotFoundError(f"Selected checkpoint is missing: {ckpt_path}")
+                ckpt = torch.load(ckpt_path, map_location="cpu")
+                info = ckpt["_checkpoint"]
+                status = info["status"]
+                self.sde.load_state_dict(ckpt["fbsde"])
+                selection = f"best_{name}"
+                report["selections"][selection] = evaluate_loaded_state(
+                    selection=selection,
+                    selected_epoch=int(
+                        status.get(
+                            "epoch",
+                            int(status["step"]) * self.cfg.log_detail_interval_epoch,
+                        )
+                    ),
+                    monitor_metric=name.replace("_", "/", 1),
+                    online_value=float(status["value"]),
+                )
+                if self.fabric.global_rank == 0 and not self.cfg.keep_best_checkpoints:
+                    ckpt_path.unlink(missing_ok=True)
+        finally:
+            self.sde.load_state_dict(final_state)
+            torch.set_rng_state(cpu_rng_state)
+            if torch.cuda.is_available() and cuda_rng_state:
+                torch.cuda.set_rng_state_all(cuda_rng_state)
+
+        if self.fabric.global_rank == 0:
+            report_path = Path(self.checkpoint_directory) / "checkpoint_evaluations.json"
+            report_path.write_text(json.dumps(report, indent=2, sort_keys=True))
+            if wandb.run is not None:
+                wandb.run.summary["seed"] = int(self.cfg.seed)
+                wandb.run.summary["report/path"] = str(report_path)
         wandb.finish()
         
     # 既存の populate_buffer_log_weights を置き換えるか、あるいは

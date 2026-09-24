@@ -4,9 +4,65 @@ import os
 from dataclasses import dataclass
 from typing import Optional, Callable, Dict, Literal
 from datetime import datetime
+import math
 
 
 PACKAGE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
+
+
+class JointMetricDivergenceStopper:
+    """Stop only after two quality metrics jointly show sustained collapse.
+
+    This deliberately does not stop on a plateau: a run may recover late.  It is
+    intended as an opt-in compute guard for expensive sweeps, not as model
+    selection (best checkpoints remain responsible for that).
+    """
+
+    def __init__(self, config):
+        self.enabled = bool(config.get("enabled", False))
+        self.primary_metric = str(config.get("primary_metric", "loss/SD"))
+        self.secondary_metric = str(config.get("secondary_metric", "loss/tvd_soft"))
+        self.min_evals = int(config.get("min_evals", 20))
+        self.primary_factor = float(config.get("primary_factor", 2.0))
+        self.secondary_delta = float(config.get("secondary_delta", 0.15))
+        self.patience = int(config.get("patience", 8))
+        self.nonfinite_patience = int(config.get("nonfinite_patience", 2))
+        self.best_primary = math.inf
+        self.best_secondary = math.inf
+        self.bad_count = 0
+        self.nonfinite_count = 0
+        self.reason = None
+
+    def update(self, metrics: Dict, eval_index: int) -> bool:
+        if not self.enabled:
+            return False
+        primary = float(metrics[self.primary_metric])
+        secondary = float(metrics[self.secondary_metric])
+        if not math.isfinite(primary) or not math.isfinite(secondary):
+            self.nonfinite_count += 1
+            if self.nonfinite_count >= self.nonfinite_patience:
+                self.reason = f"non-finite metrics for {self.nonfinite_count} evaluations"
+                return True
+            return False
+        self.nonfinite_count = 0
+        self.best_primary = min(self.best_primary, primary)
+        self.best_secondary = min(self.best_secondary, secondary)
+        if eval_index < self.min_evals:
+            self.bad_count = 0
+            return False
+        collapsed = (
+            primary > self.primary_factor * self.best_primary
+            and secondary > self.best_secondary + self.secondary_delta
+        )
+        self.bad_count = self.bad_count + 1 if collapsed else 0
+        if self.bad_count >= self.patience:
+            self.reason = (
+                f"sustained collapse for {self.bad_count} evaluations: "
+                f"{self.primary_metric}={primary:.6g} (best={self.best_primary:.6g}), "
+                f"{self.secondary_metric}={secondary:.6g} (best={self.best_secondary:.6g})"
+            )
+            return True
+        return False
 
 def cycle(iterable):
     while True:

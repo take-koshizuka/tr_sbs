@@ -27,6 +27,13 @@ def compute_reverse_ess(log_weights):
     ess = (sum_is_weights ** 2) / (len(is_weights) * sum_is_weights_squared)
     return ess
 
+def compute_raw_path_ess(log_weights):
+    """Normalized ESS of untempered path weights, robust to constant shifts."""
+    log_weights = log_weights.reshape(-1)
+    if log_weights.numel() == 0 or not torch.isfinite(log_weights).all():
+        return 0.0
+    return compute_reverse_ess(stabilize_log_weights(log_weights)).item()
+
 def normalize_log_weights(log_weights, dim=0):
     """
     Scale log weights for numerical stability.

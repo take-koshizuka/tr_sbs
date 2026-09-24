@@ -129,6 +129,46 @@ class GMM(BaseEnergy):
         if not batched:
             logp = logp.squeeze(0)
         return -logp
+
+    def score(self, x: torch.Tensor) -> torch.Tensor:
+        """Return the analytic score of the Gaussian mixture.
+
+        Computing the score through autograd retains a large graph at every
+        PIS/DIS integration step.  The closed form is both exact and much more
+        memory efficient: component scores are weighted by posterior mixture
+        responsibilities.
+        """
+        if x.dim() not in (1, 2):
+            raise ValueError(
+                f"Expected x with shape [D] or [B, D], got {tuple(x.shape)}"
+            )
+
+        input_device = x.device
+        input_dtype = x.dtype
+        batched = x.dim() == 2
+        x_work = x.to(self.device, self.dtype)
+        if not batched:
+            x_work = x_work.unsqueeze(0)
+
+        components = self.distribution.component_distribution
+        component_log_probs = components.log_prob(x_work.unsqueeze(-2))
+        log_mixture_probs = self.distribution.mixture_distribution.logits
+        responsibilities = torch.softmax(
+            component_log_probs + log_mixture_probs,
+            dim=-1,
+        )
+
+        centered = components.loc.unsqueeze(0) - x_work.unsqueeze(-2)
+        component_scores = torch.cholesky_solve(
+            centered.unsqueeze(-1),
+            components.scale_tril.unsqueeze(0),
+            upper=False,
+        ).squeeze(-1)
+        score = (responsibilities.unsqueeze(-1) * component_scores).sum(dim=-2)
+
+        if not batched:
+            score = score.squeeze(0)
+        return score.to(device=input_device, dtype=input_dtype)
     
     def eval_2D(self, x: torch.Tensor) -> torch.Tensor:
         """

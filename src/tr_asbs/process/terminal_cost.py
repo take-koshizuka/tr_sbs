@@ -4,14 +4,18 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 import ase.units as units
 import torch
 import torch.nn as nn
 
-from tr_asbs.data.atomic_data import ThermoAtomicData
-from tr_asbs.potential.base_potential import BasePotential
+if TYPE_CHECKING:
+    from tr_asbs.data.atomic_data import ThermoAtomicData
+    from tr_asbs.potential.base_potential import BasePotential
 
 
 class BaseTerminalCost(nn.Module, ABC):

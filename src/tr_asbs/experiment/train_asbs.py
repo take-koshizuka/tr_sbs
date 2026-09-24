@@ -27,7 +27,8 @@ from copy import deepcopy
 
 from tr_asbs.process.sde import ControlledSDE, ControlledFBSDE
 from tr_asbs.utils.training import EMA, TrainingCurriculum, copy_model
-from tr_asbs.utils.helper import Checkpointer, CheckpointConfig
+from tr_asbs.utils.helper import Checkpointer, CheckpointConfig, JointMetricDivergenceStopper
+from tr_asbs.utils.eval_logweight import compute_raw_path_ess
 
 import time
 
@@ -176,6 +177,8 @@ class ASBSModule:
             
         self.zeros_tensor = self.fabric.to_device(torch.zeros(self.cfg.train_batch_size))
         self.ones_tensor = self.fabric.to_device(torch.ones(self.cfg.train_batch_size))
+        self.divergence_stopper = JointMetricDivergenceStopper(self.cfg.divergence_early_stop)
+        self.early_stop_requested = False
         
         ############################################################################
         self.ckpts = {}
@@ -188,7 +191,7 @@ class ASBSModule:
                     enable=True,
                     checkpoint_dir=self.checkpoint_directory,
                     filename_fmt="{tag}.pt",
-                    mode="min",                 # loss なら "min"
+                    mode=str(self.cfg.monitor_modes.get(name, "min")),
                 ),
                 make_payload=lambda: {
                     "fbsde": self.sde.state_dict(),
@@ -227,13 +230,25 @@ class ASBSModule:
             if self.current_epoch % self.cfg.log_detail_interval_epoch == 0:
                 metrics = self.log_details(self.current_epoch // self.cfg.log_detail_interval_epoch)
                 for name in self.cfg.monitor_values:
+                    if self.current_epoch == 0 and not self.cfg.monitor_initial_state:
+                        continue
                     name_safe = name.replace("/", "_")
                     info = self.ckpts[name_safe].update(
                         value=metrics[name],
                         step=self.current_epoch // self.cfg.log_detail_interval_epoch,
                         tag_best=f"{name_safe}_best",          # ファイル名 "{tag}.pt" なので "best.pt" になる
-                        extra_status={"eval_step": metrics["eval_step"]},
+                        extra_status={"eval_step": metrics["eval_step"], "epoch": metrics["epoch"]},
                     )
+                eval_index = self.current_epoch // self.cfg.log_detail_interval_epoch
+                if self.divergence_stopper.update(metrics, eval_index):
+                    self.early_stop_requested = True
+                    print(f"Early stopping at epoch {self.current_epoch}: {self.divergence_stopper.reason}")
+                    if wandb.run is not None:
+                        wandb.run.summary["early_stop/triggered"] = True
+                        wandb.run.summary["early_stop/epoch"] = int(self.current_epoch)
+                        wandb.run.summary["early_stop/reason"] = self.divergence_stopper.reason
+            if self.early_stop_requested:
+                break
             
             current_task = self.curriculum[self.current_epoch]
             
@@ -723,6 +738,9 @@ class ASBSModule:
                 logs["figures/gt_data_1"] = self.potential.visualize(self.potential.sample(data_0.shape[0:1]), title="gt_data_1")
         else:
             logs = self.potential.log_details(results, visualize=visualize)
+
+        if "log_Ph_Pref" in results:
+            logs["eval/raw_path_ess"] = compute_raw_path_ess(results["log_Ph_Pref"])
         
         logs["epoch"] = self.current_epoch
         logs["eval_step"] = step
@@ -765,30 +783,37 @@ class ASBSModule:
             
             integrator = hydra.utils.instantiate(self.cfg.integrator, sde=self.sde)
             data_0 = self.source.sample((self.cfg.eval_samples_final,))
-            data_1 = integrator.run(
+            integral_results = integrator.run_with_logweights(
+                integrator=integrator,
+                prior_log_prob_fn=self.source.log_prob,
+                target_log_prob_fn=self.potential.log_prob,
                 initial_data=data_0,
                 center_every_step=self.potential.is_mean_free,
                 zero_last_step_noise=False,
                 return_trajectory=False,
                 progress_bar=(self.fabric.global_rank == 0) and self.cfg.progress_bar,
             )
+            data_1 = integral_results["data_1"]
             self.save_final_samples(data_0, data_1, name=f"best_{name}")
             results = {
-                "data_0": data_0[:self.cfg.eval_samples],
-                "data_1": data_1[:self.cfg.eval_samples],
+                "data_0": data_0,
+                "data_1": data_1,
+                "log_Ph_Pref": integral_results["log_Ph_Pref"],
                 'predict_drift_fn': self.sde.drift,
             }
             
             logs = self.potential.log_details(results, visualize=True)
+            logs["eval/raw_path_ess"] = compute_raw_path_ess(results["log_Ph_Pref"])
             
             if self.fabric.global_rank == 0 and wandb.run is not None:
                 for key, value in logs.items():
                     wandb.run.summary[f"best_{name}/{key}"] = value
                 wandb.run.summary[f"best_{name}/step"] = int(step)
+                wandb.run.summary[f"best_{name}/epoch"] = int(info["status"].get("epoch", step * self.cfg.log_detail_interval_epoch))
                 wandb.run.summary[f"best_{name}/value"] = float(best_val)
                 
             # ===== checkpoint 削除 =====
-            if self.fabric.global_rank == 0:
+            if self.fabric.global_rank == 0 and not self.cfg.keep_best_checkpoints:
                 ckpt_path.unlink(missing_ok=True)
         
         wandb.finish()

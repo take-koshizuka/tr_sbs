@@ -1,0 +1,38 @@
+# Path Integral Sampler (PIS)
+name: pis
+loss: elbo
+
+iters: 40000
+batch_size: ${train_batch_size}
+microbatch_size: null
+num_steps: 128
+grad_clip: 1.0
+
+# Reuse the ASBS experiment's diffusion bounds as parameters of the fixed PIS
+# cosine schedule. The PIS schedule itself and its zero initial state remain
+# unchanged; cfg.base_sde is not instantiated by the variational trainer.
+max_diffusion: ${base_sde.sigma_max}
+noise_clip: 4.0
+schedule:
+  sigma_min: ${base_sde.sigma_min}
+  s: 0.008
+  pow: 2.0
+
+method:
+  _target_: tr_asbs.variational.PISMethod
+
+model:
+  # Fair-comparison default: exactly the FourierMLP architecture used by the
+  # GMM ASBS controller.  The adapter only maps the reverse step index to the
+  # ASBS source-to-target time and ignores (and avoids computing) score hints.
+  _target_: tr_asbs.variational.ASBSFourierControl
+  num_steps: ${algorithm.num_steps}
+  num_layers: 4
+  channels: 256
+  clip_norm: 100.0
+  score_hint_mode: none
+
+optimizer:
+  _target_: torch.optim.Adam
+  lr: 5.0e-4
+  weight_decay: 0.0

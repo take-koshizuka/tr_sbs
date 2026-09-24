@@ -31,6 +31,21 @@ resume: false
 ema_decay: null
 ema_start_step: 0
 visualize: false
+monitor_modes: {}
+monitor_initial_state: true
+keep_best_checkpoints: true
+
+# Opt-in compute guard for expensive sweeps. It stops only on sustained joint
+# degradation, never merely because a metric has plateaued.
+divergence_early_stop:
+  enabled: false
+  primary_metric: loss/SD
+  secondary_metric: loss/tvd_soft
+  min_evals: 20
+  primary_factor: 2.0
+  secondary_delta: 0.15
+  patience: 8
+  nonfinite_patience: 2
 
 # Corrector-side trust-region damping (opt-in; "none" preserves existing
 # behavior exactly). See train_gamma_asbs_iw.py's GammaASBSModule.__init__ and

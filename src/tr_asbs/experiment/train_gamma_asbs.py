@@ -27,8 +27,8 @@ from omegaconf import OmegaConf
 from tr_asbs.process.sde import ControlledSDE, ControlledFBSDE
 from tr_asbs.utils.training import EMA, copy_model
 from tr_asbs.data.buffer import BatchBuffer
-from tr_asbs.utils.eval_logweight import compute_reverse_ess, normalize_log_weights
-from tr_asbs.utils.helper import Checkpointer, CheckpointConfig
+from tr_asbs.utils.eval_logweight import compute_raw_path_ess, compute_reverse_ess, normalize_log_weights
+from tr_asbs.utils.helper import Checkpointer, CheckpointConfig, JointMetricDivergenceStopper
 
 import time
 
@@ -133,6 +133,8 @@ class GammaASBSModule:
         
         self.zeros_tensor = self.fabric.to_device(torch.zeros(self.cfg.train_batch_size))
         self.ones_tensor = self.fabric.to_device(torch.ones(self.cfg.train_batch_size))
+        self.divergence_stopper = JointMetricDivergenceStopper(self.cfg.divergence_early_stop)
+        self.early_stop_requested = False
         
         ############################################################################
         self.ckpts = {}
@@ -145,7 +147,7 @@ class GammaASBSModule:
                     enable=True,
                     checkpoint_dir=self.checkpoint_directory,
                     filename_fmt="{tag}.pt",
-                    mode="min",                 # loss なら "min"
+                    mode=str(self.cfg.monitor_modes.get(name, "min")),
                 ),
                 make_payload=lambda: {
                     "fbsde": self.sde.state_dict(),
@@ -160,6 +162,17 @@ class GammaASBSModule:
     def lm(self) -> float:
         """lagrangian multiplier expressed from gamma. Kept for compatibility."""
         return (1 - self.gamma) / self.gamma
+
+    def _update_divergence_early_stop(self, metrics):
+        eval_index = self.current_epoch // self.cfg.log_detail_interval_epoch
+        if not self.divergence_stopper.update(metrics, eval_index):
+            return
+        self.early_stop_requested = True
+        print(f"Early stopping at epoch {self.current_epoch}: {self.divergence_stopper.reason}")
+        if wandb.run is not None:
+            wandb.run.summary["early_stop/triggered"] = True
+            wandb.run.summary["early_stop/epoch"] = int(self.current_epoch)
+            wandb.run.summary["early_stop/reason"] = self.divergence_stopper.reason
     
     def inner_loop_u(self):
         current_task = "adjoint_matching"
@@ -188,8 +201,11 @@ class GammaASBSModule:
                         value=metrics[name],
                         step=self.current_epoch // self.cfg.log_detail_interval_epoch,
                         tag_best=f"{name_safe}_best",          # ファイル名 "{tag}.pt" なので "best.pt" になる
-                        extra_status={"eval_step": metrics["eval_step"]},
+                        extra_status={"eval_step": metrics["eval_step"], "epoch": metrics["epoch"]},
                     )
+                self._update_divergence_early_stop(metrics)
+                if self.early_stop_requested:
+                    break
             
     def inner_loop_h(self):
         current_task = "corrector_matching"
@@ -216,8 +232,11 @@ class GammaASBSModule:
                         value=metrics[name],
                         step=self.current_epoch // self.cfg.log_detail_interval_epoch,
                         tag_best=f"{name_safe}_best",          # ファイル名 "{tag}.pt" なので "best.pt" になる
-                        extra_status={"eval_step": metrics["eval_step"]},
+                        extra_status={"eval_step": metrics["eval_step"], "epoch": metrics["epoch"]},
                     )
+                self._update_divergence_early_stop(metrics)
+                if self.early_stop_requested:
+                    break
     ############################################################################
     # Training loop structure
     ############################################################################
@@ -237,13 +256,16 @@ class GammaASBSModule:
         
         metrics = self.log_details(0)
         for name in self.cfg.monitor_values:
+            if not self.cfg.monitor_initial_state:
+                continue
             name_safe = name.replace("/", "_")
             info = self.ckpts[name_safe].update(
                 value=metrics[name],
                 step=self.current_epoch // self.cfg.log_detail_interval_epoch,
                 tag_best=f"{name_safe}_best",          # ファイル名 "{tag}.pt" なので "best.pt" になる
-                extra_status={"eval_step": metrics["eval_step"]},
+                extra_status={"eval_step": metrics["eval_step"], "epoch": metrics["epoch"]},
             )
+        self._update_divergence_early_stop(metrics)
 
         for outer_step in range(self.max_outer_loops):
             if self.gamma_schedule == "trust_region":
@@ -252,9 +274,13 @@ class GammaASBSModule:
             
             print("Starting inner loop for controller u...")
             self.inner_loop_u()
+            if self.early_stop_requested:
+                break
             
             print("Starting inner loop for corrector h...")
             self.inner_loop_h()
+            if self.early_stop_requested:
+                break
 
         self.save_checkpoint()
         self.log_final()
@@ -719,12 +745,12 @@ class GammaASBSModule:
         )
         
         results = {
-            "data_0": data_0[:self.cfg.eval_samples],
-            "data_1": integral_results['data_1'][:self.cfg.eval_samples],
-            "log_Ph_Pref": integral_results['log_Ph_Pref'][:self.cfg.eval_samples],
-            "log_Pu_Pref": integral_results['log_Pu_Pref'][:self.cfg.eval_samples],
-            'log_RN[u_next|u]_eff': integral_results['log_Pref_Pu_det'][:self.cfg.eval_samples],
-            'log_RN[u_next|u]': -integral_results['log_Pu_Pref'][:self.cfg.eval_samples],
+            "data_0": data_0[:eval_samples],
+            "data_1": integral_results['data_1'][:eval_samples],
+            "log_Ph_Pref": integral_results['log_Ph_Pref'][:eval_samples],
+            "log_Pu_Pref": integral_results['log_Pu_Pref'][:eval_samples],
+            'log_RN[u_next|u]_eff': integral_results['log_Pref_Pu_det'][:eval_samples],
+            'log_RN[u_next|u]': -integral_results['log_Pu_Pref'][:eval_samples],
             'predict_drift_fn': self.sde.drift,
         }
         
@@ -768,6 +794,7 @@ class GammaASBSModule:
                     progress_bar=(self.fabric.global_rank == 0) and self.cfg.progress_bar,
                 )
                 logs["figures/data_0_hat"] = self.potential.visualize_raw(data_0_hat, title="data_0_hat")
+        logs["eval/raw_path_ess"] = compute_raw_path_ess(results["log_Ph_Pref"])
         
         logs["epoch"] = self.current_epoch
         logs["eval_step"] = step
@@ -778,7 +805,7 @@ class GammaASBSModule:
         return logs
     
     def log_final(self):
-        final_logs = self.log_details(self.current_epoch // self.cfg.log_detail_interval_epoch, visualize=True, eval_samples=self.cfg.eval_samples*2)
+        final_logs = self.log_details(self.current_epoch // self.cfg.log_detail_interval_epoch, visualize=True, eval_samples=self.cfg.eval_samples_final)
         data_0, data_1 = final_logs.pop("data_0"), final_logs.pop("data_1")
         self.save_final_samples(data_0, data_1, name=f"last_epoch")
         # rank0だけ summary に確定値を書き込む
@@ -799,31 +826,38 @@ class GammaASBSModule:
             self.sde.eval()
             
             integrator = hydra.utils.instantiate(self.cfg.integrator, sde=self.sde)
-            data_0 = self.source.sample((self.cfg.eval_samples*2,))
+            data_0 = self.source.sample((self.cfg.eval_samples_final,))
             
-            data_1 = integrator.run(
+            integral_results = integrator.run_with_logweights(
+                integrator=integrator,
+                prior_log_prob_fn=self.source.log_prob,
+                target_log_prob_fn=self.potential.log_prob,
                 initial_data=data_0,
                 center_every_step=self.potential.is_mean_free,
                 zero_last_step_noise=False,
                 return_trajectory=False,
                 progress_bar=(self.fabric.global_rank == 0) and self.cfg.progress_bar,
             )
+            data_1 = integral_results["data_1"]
             self.save_final_samples(data_0, data_1, name=f"best_{name}")
             results = {
-                "data_0": data_0[:self.cfg.eval_samples],
-                "data_1": data_1[:self.cfg.eval_samples]
+                "data_0": data_0,
+                "data_1": data_1,
+                "log_Ph_Pref": integral_results["log_Ph_Pref"],
             }
             
             logs = self.potential.log_details(results, visualize=True)
+            logs["eval/raw_path_ess"] = compute_raw_path_ess(results["log_Ph_Pref"])
             
             if self.fabric.global_rank == 0 and wandb.run is not None:
                 for key, value in logs.items():
                     wandb.run.summary[f"best_{name}/{key}"] = value
                 wandb.run.summary[f"best_{name}/step"] = int(step)
+                wandb.run.summary[f"best_{name}/epoch"] = int(info["status"].get("epoch", step * self.cfg.log_detail_interval_epoch))
                 wandb.run.summary[f"best_{name}/value"] = float(best_val)
             
             # ===== checkpoint 削除 =====
-            if self.fabric.global_rank == 0:
+            if self.fabric.global_rank == 0 and not self.cfg.keep_best_checkpoints:
                 ckpt_path.unlink(missing_ok=True)
                 
         wandb.finish()

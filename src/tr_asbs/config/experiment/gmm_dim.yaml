@@ -30,7 +30,7 @@ iw_clip_value: 10
 ################################################################################
 # Training settings
 ################################################################################
-max_outer_loops: 80
+max_outer_loops: 150
 adjoint_matching_epochs: 150
 corrector_matching_epochs: 50
 steps_per_epoch: 100
@@ -42,7 +42,11 @@ num_samples_for_dual_loss: [5000, 40]
 # Logging
 ################################################################################
 log_detail_interval_epoch: 200
-monitor_values: [ "loss/tvd_soft", "loss/neg_avg_energy"]
+monitor_values: ["loss/SD", "eval/raw_path_ess"]
+monitor_modes:
+  loss/SD: min
+  eval/raw_path_ess: max
+monitor_initial_state: false
 
 ################################################################################
 # Models

@@ -4,13 +4,22 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 from collections import defaultdict
+from functools import lru_cache
 from typing import Any, Dict, List, Mapping, Sequence
 
 import torch
 from torch.utils.data import Dataset
 
-from tr_asbs.data.atomic_data import ThermoAtomicData
+
+@lru_cache(maxsize=1)
+def _thermo_atomic_data_type():
+    """Import the optional atomistic data type only when that buffer is used."""
+    from tr_asbs.data.atomic_data import ThermoAtomicData
+
+    return ThermoAtomicData
 
 
 class BatchBuffer(Dataset):
@@ -102,11 +111,13 @@ class ThermoAtomicDataBuffer(Dataset):
         self.storage = defaultdict(list)
         self.filter_nan = filter_nan
 
-    def extend(self, **kwargs: ThermoAtomicData | torch.Tensor) -> None:
+    def extend(self, **kwargs: Any) -> None:
         """Extend the buffer with a dictionary of ThermoAtomicData and tensors."""
+        thermo_atomic_data_type = _thermo_atomic_data_type()
+
         # Extract the batch index
         for value in kwargs.values():
-            if isinstance(value, ThermoAtomicData):
+            if isinstance(value, thermo_atomic_data_type):
                 num_graphs, batch_index = value.num_graphs, value.batch
                 num_atoms = batch_index.shape[0]
                 batch_index = batch_index.cpu()
@@ -119,14 +130,14 @@ class ThermoAtomicDataBuffer(Dataset):
 
         # Add data to the buffer
         for key, value in kwargs.items():
-            if not isinstance(value, (ThermoAtomicData, torch.Tensor)):
+            if not isinstance(value, (thermo_atomic_data_type, torch.Tensor)):
                 raise TypeError(
                     f"Expected ThermoAtomicData or torch.Tensor, got {type(value)} for "
                     f"key '{key}'"
                 )
             # Always move to cpu for storage
             value = value.to("cpu")
-            if isinstance(value, ThermoAtomicData):
+            if isinstance(value, thermo_atomic_data_type):
                 value_list = value.batch_to_atomicdata_list()
             else:  # torch.Tensor
                 if value.shape[0] == num_atoms:  # per-atom property
@@ -166,15 +177,16 @@ class ThermoAtomicDataBuffer(Dataset):
         except StopIteration:
             return 0
 
-    def __getitem__(self, idx) -> dict[str, ThermoAtomicData | torch.Tensor]:
+    def __getitem__(self, idx) -> dict[str, Any]:
         return {key: value[idx] for key, value in self.storage.items()}
 
     @staticmethod
     def collate_fn(batch: Sequence[Any]) -> Any:
         """Collate function to combine a batch of data into a single dictionary."""
+        thermo_atomic_data_type = _thermo_atomic_data_type()
         element = batch[0]
-        if isinstance(element, ThermoAtomicData):
-            return ThermoAtomicData.from_data_list(batch)
+        if isinstance(element, thermo_atomic_data_type):
+            return thermo_atomic_data_type.from_data_list(batch)
         elif isinstance(element, torch.Tensor):
             return torch.cat(batch, dim=0)
         elif isinstance(element, float):

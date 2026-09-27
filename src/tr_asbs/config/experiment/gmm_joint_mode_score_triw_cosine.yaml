@@ -1,0 +1,46 @@
+# @package _global_
+defaults:
+  - gmm_mode
+  - _self_
+
+# Joint K=40, d=100 target with the original mode-series geometry and prior.
+name: gmm_joint_mode_score_triw_cosine
+potential:
+  dim: 100
+  num_components: 40
+  loc_scaling: 40
+source:
+  scale: 30.0
+
+score_conditioned_model:
+  _target_: tr_asbs.variational.TRIWScoreConditionedControl
+  dim: ${potential.dim}
+  num_steps: 128
+  num_layers: 2
+  num_hid: 64
+  outer_clip: 1.0e4
+  inner_clip: 1.0e2
+  weight_init: 1.0e-8
+  bias_init: 1.0
+
+controller: ${score_conditioned_model}
+corrector: ${score_conditioned_model}
+
+base_sde:
+  _target_: tr_asbs.process.sde.PISCosineSDE
+  sigma_min: 0.1
+  sigma_max: 32.0
+  num_steps: 128
+  s: 0.008
+  power: 2.0
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 128
+    rescale_t: null
+
+report_seed: 12345

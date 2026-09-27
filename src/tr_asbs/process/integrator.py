@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 
-from tr_asbs.process.sde import BaseSDE, FwdBwdSDE, DataType, _is_graph_data
+from tr_asbs.process.sde import BaseSDE, ControlledFBSDE, FwdBwdSDE, DataType, _is_graph_data
 from tr_asbs.utils.geometry import subtract_com_vector, subtract_mean_batch
 from tr_asbs.utils.gaussian_utils import gaussian_log_prob
 
@@ -358,7 +358,14 @@ class ExponentialIntegrator(BaseIntegrator):
         dt: torch.Tensor,  # scalar
     ) -> Tuple[DataType, DataType]:
         """Return deterministic and stochastic previous states for reverse exponential step."""
-        drift = (-self.sde.bwd_drift(time, data)) * (-dt)
+        if isinstance(self.sde, ControlledFBSDE):
+            # Piecewise schedules need the coefficient of the interval being
+            # traversed, while continuous schedules retain their old right-
+            # endpoint drift convention via backward_step_diffusion().
+            bwd_drift = self.sde.bwd_drift(time, data, interval_dt=dt)
+        else:
+            bwd_drift = self.sde.bwd_drift(time, data)
+        drift = (-bwd_drift) * (-dt)
         diff_sq = self.sde.base_sde.diffsquare_integral(time) - self.sde.base_sde.diffsquare_integral(time - dt)
         diffusion = diff_sq.sqrt() * self.sde.randn_like(data)
         deterministic_prev = data + drift

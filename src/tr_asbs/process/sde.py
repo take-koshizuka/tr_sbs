@@ -47,6 +47,15 @@ class BaseSDE(nn.Module, ABC):
                 noise = subtract_com_vector(noise, n_particles=data.shape[-2], n_dimensions=data.shape[-1]) 
         return noise
 
+    def backward_step_diffusion(self, time: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+        """Diffusion coefficient used by a reverse step ending at ``time - dt``.
+
+        Continuous schedules retain the existing right-endpoint convention.
+        A schedule that is constant on each integration interval can override
+        this to use that interval's coefficient instead.
+        """
+        return self.diffusion(time)
+
 
 class FwdBwdSDE(BaseSDE):
     """Base class for SDEs that support both Forward and Backward dynamics.
@@ -210,6 +219,70 @@ class VESDE(ZeroDriftSDE):
         return (self.sigma_max**2) * (1 - sigma_ratio ** (-2 * time))
 
 
+class PISCosineSDE(ZeroDriftSDE):
+    """Zero-drift reference with the exact discrete PIS cosine coefficients.
+
+    PIS consumes its one-indexed schedule in reverse order. Here coefficient
+    ``i`` applies to the forward interval ``[i / num_steps, (i+1) / num_steps)``.
+    Squared diffusion is therefore piecewise constant and its integral is
+    piecewise linear, making every Gaussian transition variance exact on the
+    matched uniform grid used by the exponential integrator and path weights.
+    """
+
+    def __init__(
+        self,
+        sigma_min: float = 0.01,
+        sigma_max: float = 10.0,
+        num_steps: int = 128,
+        s: float = 0.008,
+        power: float = 2.0,
+        is_mean_free: bool = False,
+    ):
+        super().__init__(is_mean_free=is_mean_free)
+        # Import here to keep the usual VE process independent of the
+        # variational package and share PIS's exact schedule implementation.
+        from tr_asbs.variational.schedules import cosine_diffusion_schedule
+
+        values = cosine_diffusion_schedule(
+            num_steps=num_steps,
+            sigma_min=sigma_min,
+            sigma_max=sigma_max,
+            s=s,
+            power=power,
+            dtype=torch.double,
+        ).flip(0)
+        self.num_steps = int(num_steps)
+        self.register_buffer("step_diffusions", values)
+        self.register_buffer(
+            "cumulative_variances",
+            torch.cat((values.new_zeros(1), values.square().cumsum(0) / self.num_steps)),
+        )
+
+    def _scaled_time(self, time: torch.Tensor | float) -> torch.Tensor:
+        time = torch.as_tensor(time, dtype=torch.double, device=self.step_diffusions.device)
+        return (time * self.num_steps).clamp(0.0, float(self.num_steps))
+
+    def _interval_index(self, time: torch.Tensor | float) -> torch.Tensor:
+        return self._scaled_time(time).floor().long().clamp(max=self.num_steps - 1)
+
+    def diffusion(self, time: torch.Tensor) -> torch.Tensor:
+        coefficient = self.step_diffusions[self._interval_index(time)]
+        return coefficient.to(time)
+
+    def backward_step_diffusion(self, time: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+        # The backward control is evaluated at the right endpoint, but its
+        # diffusion must belong to the interval traversed by that step.
+        return self.diffusion(time - dt)
+
+    def diffsquare_integral(self, time: torch.Tensor | float) -> torch.DoubleTensor:
+        scaled_time = self._scaled_time(time)
+        index = scaled_time.floor().long().clamp(max=self.num_steps - 1)
+        fraction = scaled_time - index
+        return self.cumulative_variances[index] + (
+            fraction * self.step_diffusions[index].square() / self.num_steps
+        )
+
+
 class EDMSDE(ZeroDriftSDE):
     """EDM schedule from [Karras et al., 2022]."""
     def __init__(self, sigma_min: float = 0.001, sigma_max: float = 1.0, rho: float = 7.0, is_mean_free: bool = False):
@@ -314,10 +387,18 @@ class ControlledFBSDE(ControlledSDE, FwdBwdSDE):
     # drift() is inherited from ControlledSDE
 
     def bwd_drift(
-        self, time: torch.Tensor, data: DataType, return_control: bool = False
+        self,
+        time: torch.Tensor,
+        data: DataType,
+        return_control: bool = False,
+        interval_dt: torch.Tensor | None = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
 
-        diff = self.diffusion(time)
+        diff = (
+            self.diffusion(time)
+            if interval_dt is None
+            else self.base_sde.backward_step_diffusion(time, interval_dt)
+        )
 
         if _is_graph_data(data):
             # See ControlledSDE.drift for why graph data needs explicit

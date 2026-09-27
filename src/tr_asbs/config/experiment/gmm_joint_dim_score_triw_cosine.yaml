@@ -1,0 +1,48 @@
+# @package _global_
+defaults:
+  - gmm_dim
+  - _self_
+
+# Joint K=40, d=100 target. The inherited dim-series target geometry and
+# source scale are explicit here so a different GMM family is never selected
+# accidentally when launching this campaign.
+name: gmm_joint_dim_score_triw_cosine
+potential:
+  dim: 100
+  num_components: 40
+  loc_scaling: 7
+source:
+  scale: 5.0
+
+score_conditioned_model:
+  _target_: tr_asbs.variational.TRIWScoreConditionedControl
+  dim: ${potential.dim}
+  num_steps: 128
+  num_layers: 2
+  num_hid: 64
+  outer_clip: 1.0e4
+  inner_clip: 1.0e2
+  weight_init: 1.0e-8
+  bias_init: 1.0
+
+controller: ${score_conditioned_model}
+corrector: ${score_conditioned_model}
+
+base_sde:
+  _target_: tr_asbs.process.sde.PISCosineSDE
+  sigma_min: 0.1
+  sigma_max: 16.0
+  num_steps: 128
+  s: 0.008
+  power: 2.0
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 128
+    rescale_t: null
+
+report_seed: 12345

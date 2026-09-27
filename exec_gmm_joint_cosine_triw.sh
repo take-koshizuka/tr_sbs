@@ -8,7 +8,7 @@
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=12
-#SBATCH --exclude=htc-cmp[101-148,501-532]
+#SBATCH --exclude=htc-cmp[101-148,501-532],htc-gpu024
 
 set -euo pipefail
 source ~/.profile

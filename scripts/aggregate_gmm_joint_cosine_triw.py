@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate the two K=40, d=100 cosine TR-IW target geometries."""
+"""Aggregate score-conditioned cosine TR-IW tuning campaigns."""
 
 from __future__ import annotations
 
@@ -17,6 +17,22 @@ GRIDS = {
     "dim": {(sigma, bound) for sigma in (8, 16, 32) for bound in (0.03, 0.1, 0.3)},
     "mode": {(sigma, bound) for sigma in (32, 64, 128) for bound in (0.1, 0.3, 1.0)},
 }
+MODE_K40_D10_GRIDS = {
+    "mode": {(sigma, bound) for sigma in (16, 32, 64, 128) for bound in (0.1, 0.3, 1.0)},
+}
+CAMPAIGN_GRIDS = {"joint-k40-d100": GRIDS, "mode-k40-d10": MODE_K40_D10_GRIDS}
+
+
+def campaign_description(campaign: str) -> tuple[str, str]:
+    if campaign == "mode-k40-d10":
+        return (
+            "K=40, d=10 cosine TR-IW tuning",
+            "Mode-series target (loc_scaling=40, source.scale=30); target seed 0; model seeds 0/1/2.",
+        )
+    return (
+        "K=40, d=100 cosine TR-IW tuning",
+        "Two target geometries are reported separately: dim (loc_scaling=7, source.scale=5) and mode (loc_scaling=40, source.scale=30). Target seed is fixed at 0; model seeds are 0/1/2.",
+    )
 
 
 def read_tsv(path: Path) -> list[dict[str, str]]:
@@ -82,16 +98,18 @@ def rank_values(row: dict) -> tuple[float, float, float, float]:
     )
 
 
-def stage1(rows: list[dict], output_dir: Path) -> None:
+def stage1(rows: list[dict], output_dir: Path, campaign: str) -> None:
     selected = [row for row in rows if row["selection"] == "best_loss_SD"]
-    for suite, grid in GRIDS.items():
+    grids = CAMPAIGN_GRIDS[campaign]
+    for suite, grid in grids.items():
         found = {(row["sigma_max"], row["trust_region_bound"]) for row in selected if row["suite"] == suite}
         if found != grid:
             raise RuntimeError(f"Incomplete {suite} grid: expected={grid}, found={found}")
-    if len(selected) != 18 or len(rows) != 54:
-        raise RuntimeError(f"Expected 18 runs / 54 checkpoint rows, got {len(selected)} / {len(rows)}")
+    expected = sum(map(len, grids.values()))
+    if len(selected) != expected or len(rows) != expected * len(SELECTIONS):
+        raise RuntimeError(f"Expected {expected} runs / {expected * len(SELECTIONS)} checkpoint rows, got {len(selected)} / {len(rows)}")
     candidates = []
-    for suite in ("dim", "mode"):
+    for suite in grids:
         ranked = sorted((row for row in selected if row["suite"] == suite), key=rank_values)
         for rank, row in enumerate(ranked[:2], 1):
             candidates.append({
@@ -105,8 +123,9 @@ def stage1(rows: list[dict], output_dir: Path) -> None:
                 "seed0_raw_path_ESS": row["eval/raw_path_ess"],
             })
     write_table(output_dir / "top2_candidates.tsv", candidates, delimiter="\t")
+    title, _ = campaign_description(campaign)
     lines = [
-        "# K=40, d=100 cosine TR-IW tuning: stage 1",
+        f"# {title}: stage 1",
         "",
         "Score-conditioned control; 128 exponential-integrator transitions; PIS zero-drift cosine noise; target seed 0; model seed 0.",
         "The reported sigma_max is the PIS schedule parameter (the attained maximum is approximately half).",
@@ -123,9 +142,10 @@ def stage1(rows: list[dict], output_dir: Path) -> None:
     (output_dir / "REPORT.md").write_text("\n".join(lines))
 
 
-def final(rows: list[dict], candidates_path: Path, output_dir: Path) -> None:
+def final(rows: list[dict], candidates_path: Path, output_dir: Path, campaign: str) -> None:
     candidate_rows = read_tsv(candidates_path)
-    if len(candidate_rows) != 4:
+    grids = CAMPAIGN_GRIDS[campaign]
+    if len(candidate_rows) != 2 * len(grids):
         raise RuntimeError("Expected two candidates per target geometry")
     summary = []
     for candidate in candidate_rows:
@@ -153,10 +173,11 @@ def final(rows: list[dict], candidates_path: Path, output_dir: Path) -> None:
                 **values,
             })
     write_table(output_dir / "three_seed_summary.csv", summary)
+    title, description = campaign_description(campaign)
     lines = [
-        "# K=40, d=100 cosine TR-IW tuning: final three-seed report",
+        f"# {title}: final three-seed report",
         "",
-        "Two target geometries are reported separately: dim (loc_scaling=7, source.scale=5) and mode (loc_scaling=40, source.scale=30). Target seed is fixed at 0; model seeds are 0/1/2.",
+        description,
         "All metrics use the same 4,000-sample evaluation seed 12345. Means are shown with standard errors. The three checkpoint selections are kept separate.",
         "",
         "| Target | sigma_max | TR bound | Checkpoint | SD | TVD-soft | W2 | raw path ESS |",
@@ -170,7 +191,7 @@ def final(rows: list[dict], candidates_path: Path, output_dir: Path) -> None:
             f"{cell('loss/SD')} | {cell('loss/tvd_soft')} | {cell('loss/W_2')} | {cell('eval/raw_path_ess')} |"
         )
     lines.extend(["", "## Selected parameters", ""])
-    for suite in ("dim", "mode"):
+    for suite in grids:
         choices = [row for row in summary if row["suite"] == suite and row["selection"] == "best_loss_SD"]
         first, second = sorted(choices, key=lambda row: row["loss/SD_mean"])
         combined_se = math.hypot(first["loss/SD_se"], second["loss/SD_se"])
@@ -199,6 +220,7 @@ def main() -> None:
     parser.add_argument("--stage2-manifest", type=Path)
     parser.add_argument("--candidates", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--campaign", choices=CAMPAIGN_GRIDS, default="joint-k40-d100")
     args = parser.parse_args()
     rows = report_rows(args.stage1_manifest)
     if args.stage2_manifest is not None:
@@ -208,9 +230,9 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     write_table(args.output_dir / "checkpoint_metrics.csv", rows)
     if args.stage2_manifest is None:
-        stage1(rows, args.output_dir)
+        stage1(rows, args.output_dir, args.campaign)
     else:
-        final(rows, args.candidates, args.output_dir)
+        final(rows, args.candidates, args.output_dir, args.campaign)
     print(args.output_dir / "REPORT.md")
 
 

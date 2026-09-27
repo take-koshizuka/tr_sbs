@@ -21,18 +21,20 @@ SIGMA_MAX="${GMM_SIGMA_MAX:?Set GMM_SIGMA_MAX}"
 TRUST_BOUND="${GMM_TRUST_REGION_BOUND:?Set GMM_TRUST_REGION_BOUND}"
 SEED="${GMM_SEED:?Set GMM_SEED}"
 STAGE="${GMM_STAGE:?Set GMM_STAGE}"
+DIFFICULTY="${GMM_DIFFICULTY:-k40_d100}"
 
-case "${SUITE}" in
-  dim) EXPERIMENT=gmm_joint_dim_score_triw_cosine ;;
-  mode) EXPERIMENT=gmm_joint_mode_score_triw_cosine ;;
-  *) echo "Invalid target suite: ${SUITE}" >&2; exit 2 ;;
+case "${DIFFICULTY}:${SUITE}" in
+  k40_d100:dim) EXPERIMENT=gmm_joint_dim_score_triw_cosine ;;
+  k40_d100:mode) EXPERIMENT=gmm_joint_mode_score_triw_cosine ;;
+  k40_d10:mode) EXPERIMENT=gmm_mode_score_triw_cosine ;;
+  *) echo "Invalid target: ${DIFFICULTY}:${SUITE}" >&2; exit 2 ;;
 esac
 case "${STAGE}" in smoke|stage1|stage2) ;; *) echo "Invalid stage: ${STAGE}" >&2; exit 2 ;; esac
 [[ "${SEED}" =~ ^[012]$ ]] || { echo "Invalid model seed: ${SEED}" >&2; exit 2; }
 [[ -x "${PYTHON}" ]] || { echo "Python not executable: ${PYTHON}" >&2; exit 2; }
 
 BOUND_LABEL="${TRUST_BOUND/./p}"
-RUN_NAME="cosine_triw_${STAGE}_${SUITE}_k40_d100_smax${SIGMA_MAX}_tr${BOUND_LABEL}_seed${SEED}"
+RUN_NAME="cosine_triw_${STAGE}_${SUITE}_${DIFFICULTY}_smax${SIGMA_MAX}_tr${BOUND_LABEL}_seed${SEED}"
 RUN_DIR="${RUN_ROOT}/${RUN_NAME}"
 mkdir -p "${RUN_DIR}/.tmp"
 cd "${REPO_ROOT}"
@@ -62,7 +64,7 @@ ARGS=(
   "divergence_early_stop.secondary_delta=0.15"
   "divergence_early_stop.patience=8"
   "divergence_early_stop.nonfinite_patience=2"
-  "fabric.loggers.tags=[gmm,score_hint,tr_iw,pis_cosine,matched_128,k40_d100,${SUITE},${STAGE},sigma${SIGMA_MAX},tr${BOUND_LABEL},seed${SEED}]"
+  "fabric.loggers.tags=[gmm,score_hint,tr_iw,pis_cosine,matched_128,${DIFFICULTY},${SUITE},${STAGE},sigma${SIGMA_MAX},tr${BOUND_LABEL},seed${SEED}]"
   "root=${RUN_ROOT}"
   "hydra.run.dir=${RUN_DIR}"
   "progress_bar=false"
@@ -85,7 +87,7 @@ if [[ "${STAGE}" == smoke ]]; then
   )
 fi
 
-echo "stage=${STAGE} suite=${SUITE} K=40 d=100 sigma_max=${SIGMA_MAX} trust_region_bound=${TRUST_BOUND} model_seed=${SEED} target_seed=0"
+echo "stage=${STAGE} suite=${SUITE} difficulty=${DIFFICULTY} sigma_max=${SIGMA_MAX} trust_region_bound=${TRUST_BOUND} model_seed=${SEED} target_seed=0"
 echo "experiment=${EXPERIMENT} steps=128 solver=exponential output=${RUN_DIR}"
 echo "git_commit=$(git rev-parse HEAD)"
 printf 'command:'; printf ' %q' "${PYTHON}" -u -m tr_asbs.experiment.train_gamma_asbs_iw "${ARGS[@]}"; printf '\n'

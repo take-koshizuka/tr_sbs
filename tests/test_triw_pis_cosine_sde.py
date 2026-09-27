@@ -122,6 +122,7 @@ def test_joint_config_selects_cosine_without_changing_ve_configs():
     with hydra.initialize_config_dir(config_dir=str(config_dir), version_base=None):
         dim_joint = hydra.compose("train", overrides=["experiment=gmm_joint_dim_score_triw_cosine"])
         mode_joint = hydra.compose("train", overrides=["experiment=gmm_joint_mode_score_triw_cosine"])
+        mode_k40 = hydra.compose("train", overrides=["experiment=gmm_mode_score_triw_cosine"])
         legacy = hydra.compose("train", overrides=["experiment=gmm_dim"])
     for joint, loc_scaling, source_scale in (
         (dim_joint, 7, 5.0),
@@ -134,5 +135,11 @@ def test_joint_config_selects_cosine_without_changing_ve_configs():
         assert joint.base_sde._target_ == "tr_asbs.process.sde.PISCosineSDE"
         assert joint.base_sde.num_steps == 128
         assert len(hydra.utils.instantiate(joint.integrator.timesteps)) - 1 == 128
+    assert mode_k40.potential.dim == 10
+    assert mode_k40.potential.num_components == 40
+    assert mode_k40.potential.loc_scaling == 40
+    assert mode_k40.source.scale == 30.0
+    assert mode_k40.base_sde._target_ == "tr_asbs.process.sde.PISCosineSDE"
+    assert len(hydra.utils.instantiate(mode_k40.integrator.timesteps)) - 1 == 128
     assert legacy.base_sde._target_ == "tr_asbs.process.sde.VESDE"
     assert len(hydra.utils.instantiate(legacy.integrator.timesteps)) - 1 == 200

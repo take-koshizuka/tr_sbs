@@ -218,7 +218,10 @@ def main() -> None:
     parser.add_argument("--python", type=Path, required=True)
     parser.add_argument("--advance", action="store_true")
     args = parser.parse_args()
-    repo, root, log_root, python = (p.resolve() for p in (args.repo_root, args.run_root, args.log_root, args.python))
+    repo, root, log_root = (p.resolve() for p in (args.repo_root, args.run_root, args.log_root))
+    # Keep the virtualenv's symlink path. Path.resolve() would follow
+    # .venv/bin/python to its base interpreter and silently lose site-packages.
+    python = args.python.absolute()
     log_root.mkdir(parents=True, exist_ok=True)
     root.mkdir(parents=True, exist_ok=True)
     with (log_root / "monitor.lock").open("w") as lock:

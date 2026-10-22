@@ -26,7 +26,7 @@ def submit(campaign, plan, python, stage, candidate, rows):
         raise RuntimeError('Existing intent/output; duplicate dispatch prohibited')
     command = ['sbatch','--parsable','--partition=gpu','--gres=gpu:1','--cpus-per-task=4',
         '--mem=32G','--exclude=htc-gpu024','--time='+('00:45:00' if stage=='smoke' else '3-00:00:00'),'--job-name=aldp-adjoint-'+candidate,
-        '--output='+str(campaign/'logs'/f'{key}_%j.log'),str(ROOT/'exec_aldp_adjoint_loss_grid.sh'),
+        '--output='+str(campaign/'logs'/f'{key}_%j.log'),str(ROOT/'scripts/slurm/exec_aldp_adjoint_loss_grid.sh'),
         str(ROOT),str(python),str(campaign),stage,candidate]
     (campaign/'logs').mkdir(exist_ok=True)
     write_json(intent,dict(status='dispatching',command=command))

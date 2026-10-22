@@ -26,7 +26,7 @@ def submit(campaign, plan, python, candidate, rows):
     command = ['sbatch','--parsable','--partition=gpu','--gres=gpu:1','--cpus-per-task=4',
         '--mem=32G','--exclude=htc-gpu024','--time=3-00:00:00',
         '--job-name=aldp-lv-scaled-'+candidate,'--output='+str(log),
-        str(ROOT/'exec_aldp_noise_solver_grid.sh'),str(ROOT),str(python),str(campaign),'full',candidate]
+        str(ROOT/'scripts/slurm/exec_aldp_noise_solver_grid.sh'),str(ROOT),str(python),str(campaign),'full',candidate]
     write_json(intent, dict(status='dispatching',command=command))
     job = execute(command).stdout.strip().split(';')[0]
     if not job.isdigit():

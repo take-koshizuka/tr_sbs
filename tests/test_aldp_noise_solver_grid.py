@@ -1,7 +1,10 @@
 """Finite kernel compatibility, fixed scientific axes and cost guards; no MD."""
+
+import pytest
+
+pytest.importorskip("jax", reason="Requires the jax extra: uv sync --extra jax")
 from pathlib import Path
 import sys
-import pytest
 import torch
 from hydra.utils import instantiate
 

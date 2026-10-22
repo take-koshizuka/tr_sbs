@@ -122,7 +122,7 @@ Execution/monitoring
    reported and cannot pass geometry,without filtering or changing samples.
    Smoke must still pass the strict roundtrip check. Freeze flags in stage plans
    only after audited stability results. Never modify current running snapshots.
-   Executor exec_aldp_component_campaign.sh reuses the shared trainer/Slurm API.
+   Executor scripts/slurm/exec_aldp_component_campaign.sh reuses the shared trainer/Slurm API.
    monitor_aldp_mechanism_campaign.py verifies component contracts when the plan
    includes component_diagnostics and stability_diagnostics. Loss-aware cost
    verification remains backwards-compatible with historical CE receipts.

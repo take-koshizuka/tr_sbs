@@ -39,7 +39,7 @@ def submit(campaign, plan, python, source_sha):
     log.parent.mkdir(parents=True, exist_ok=True)
     command = ['sbatch','--parsable','--job-name=aldp-jax-curve','--partition=gpu',
         '--gres=gpu:1','--cpus-per-task=4','--mem=32G','--time=06:00:00',
-        '--exclude=htc-gpu024',f'--output={log}',str(ROOT/'exec_aldp_jax_inner_curve.sh'),
+        '--exclude=htc-gpu024',f'--output={log}',str(ROOT/'scripts/slurm/exec_aldp_jax_inner_curve.sh'),
         str(ROOT),str(python),str(campaign)]
     write_json(intent, dict(status='dispatching', command=command, output=str(output)))
     response = execute(command).stdout.strip().split(';')[0]

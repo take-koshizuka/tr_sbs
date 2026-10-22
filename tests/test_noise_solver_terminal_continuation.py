@@ -1,4 +1,7 @@
+
 import pytest
+
+pytest.importorskip("jax", reason="Requires the jax extra: uv sync --extra jax")
 from monitor_aldp_noise_solver_grid import classified_terminal_failures
 
 def test_no_classification():

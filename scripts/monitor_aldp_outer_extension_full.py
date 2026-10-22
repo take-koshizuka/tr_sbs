@@ -20,7 +20,7 @@ def main():
    intent=c/'submission_intent.json';out=c/'outer_extension/normal'
    if intent.exists() or out.exists():raise RuntimeError('Existing dispatch/output; reconcile')
    log=c/'logs/aldp-outer-full-%j.out';log.parent.mkdir(parents=True,exist_ok=True)
-   cmd=['sbatch','--parsable','--partition=gpu','--gres=gpu:1','--cpus-per-task=4','--mem=32G','--time=06:00:00','--exclude=htc-gpu024',f'--output={log}',str(ROOT/'exec_aldp_outer_extension_full.sh'),str(ROOT),a.python,str(c)]
+   cmd=['sbatch','--parsable','--partition=gpu','--gres=gpu:1','--cpus-per-task=4','--mem=32G','--time=06:00:00','--exclude=htc-gpu024',f'--output={log}',str(ROOT/'scripts/slurm/exec_aldp_outer_extension_full.sh'),str(ROOT),a.python,str(c)]
    write_json(intent,dict(status='dispatching',command=cmd));job=execute(cmd).stdout.strip().split(';')[0]
    if not job.isdigit():raise RuntimeError('Unparseable job; reconcile')
    row=dict(job_id=job,stage='outer_extension',candidate='normal',seed=0,run_directory=str(out),log_path=str(log).replace('%j',job),repo=str(ROOT),python=a.python,source_sha256=source,plan_sha256=sha256(c/'plan.json'))

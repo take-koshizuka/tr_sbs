@@ -57,6 +57,7 @@ def reports():
 
 
 def test_cached_control_does_not_become_a_dispatch_case_or_use_b_for_selection():
+    pytest.importorskip("jax", reason="Requires the jax extra: uv sync --extra jax")
     fresh, normal, plan = reports()
     before = deepcopy(plan)
     result = compare_cached_reference(fresh, normal, plan)
@@ -70,6 +71,7 @@ def test_cached_control_does_not_become_a_dispatch_case_or_use_b_for_selection()
 
 
 def test_foreign_bc_or_source_cannot_enter_cached_comparison():
+    pytest.importorskip("jax", reason="Requires the jax extra: uv sync --extra jax")
     fresh, normal, plan = reports()
     fresh['diagnostics']['next_outer_validation']['batch_path'] = '/own_u/heldout_h.pt'
     with pytest.raises(ValueError, match='fixed normal BC bank'):

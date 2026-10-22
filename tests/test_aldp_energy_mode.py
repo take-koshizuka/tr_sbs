@@ -1,8 +1,11 @@
 """Density and force contracts; no OpenMM context or molecular simulation."""
 
+import pytest
+
+pytest.importorskip("normflows", reason="Requires the molecular extra: uv sync --extra molecular")
+
 import math
 
-import pytest
 import torch
 from torch import nn
 

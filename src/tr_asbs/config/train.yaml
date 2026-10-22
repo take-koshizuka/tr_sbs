@@ -2,8 +2,7 @@
 defaults:
   - _self_
   - experiment: ring_gmm
-root: ${oc.env:TR_ASBS_ROOT,/scratch/htc/tkoshizuka/tr_asbs}
-# root: /scratch/htc/tkoshizuka/tr_asbs
+root: ${oc.env:TR_ASBS_ROOT,.}
 seed: 0
 
 hydra:
@@ -101,13 +100,11 @@ fabric:
   loggers:
     _target_: wandb.integration.lightning.fabric.WandbLogger
     name: ${name}
-    entity: ml-takeshi-work
-    project: tr_asbs
-    #entity: ais2t_guests
-    #project: measure_transport
+    entity: ${oc.env:WANDB_ENTITY,null}
+    project: ${oc.env:WANDB_PROJECT,tr_asbs}
     tags: null
     save_dir: ${hydra:run.dir}
     group: null
   
 wandb_host: https://api.wandb.ai
-wandb_mode: online
+wandb_mode: ${oc.env:WANDB_MODE,online}

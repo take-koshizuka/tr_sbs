@@ -17,7 +17,10 @@ def test_capture_stops_before_optimizer_update(tmp_path,monkeypatch):
     m=SimpleNamespace(controller=model,corrector=model,prev_integrator=model,prev_corrector=model,controller_optimizer=opt,corrector_optimizer=opt,adjoint_buffer=buffer,corrector_buffer=buffer,fabric=SimpleNamespace(device=torch.device('cpu')),current_epoch=0,global_step=0,outer_step=0,phase='u',phase_epoch=0,gamma=1.,V0=0.,gamma_h=1.,potential=SimpleNamespace(aldp_potential=SimpleNamespace(openmm_configurations_evaluated=0)),sampling_metadata=lambda:{})
     m.adjoint_matching_log_variance_step=lambda b:{'loss':torch.tensor(float('inf'))}
     m.training_step=lambda b,t:m.adjoint_matching_log_variance_step(b)
+    original_clip=shared.clip_gradients_with_overflow_fallback
     install(m,tmp_path,{'stop_epoch':1100,'OpenMM_cap':150000})
+    assert shared.clip_gradients_with_overflow_fallback is original_clip
     with pytest.raises(Captured):m.training_step({'x':torch.ones(1)},'adjoint_matching')
+    assert shared.clip_gradients_with_overflow_fallback is original_clip
     assert torch.equal(before,model.weight) and not opt.state
     w=torch.load(tmp_path/'witness.pt',weights_only=False);assert w['reason']=='loss_nonfinite';assert torch.equal(w['batch']['x'],torch.ones(1));assert 'pre_forward_rng' in w

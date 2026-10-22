@@ -51,10 +51,15 @@ def install(module,out,plan):
         if task!='adjoint_matching' or module.current_epoch>=plan['stop_epoch']:raise LimitReached('Registered prefix limit')
         if module.potential.aldp_potential.openmm_configurations_evaluated>plan['OpenMM_cap']:raise LimitReached('OpenMM cap')
         context.clear();context.update(batch=batch,rng=_rng_state(module))
-        result=original(batch,task)
-        if not result:save('unexpected_reject')
-        return result
-    module.adjoint_matching_log_variance_step=loss;shared.clip_gradients_with_overflow_fallback=clipping;module.training_step=step
+        previous_clip=shared.clip_gradients_with_overflow_fallback
+        shared.clip_gradients_with_overflow_fallback=clipping
+        try:
+            result=original(batch,task)
+            if not result:save('unexpected_reject')
+            return result
+        finally:
+            shared.clip_gradients_with_overflow_fallback=previous_clip
+    module.adjoint_matching_log_variance_step=loss;module.training_step=step
 
 def main():
     from run_aldp_chart_campaign import verify_source,sha256,train_case,write_json,receipt

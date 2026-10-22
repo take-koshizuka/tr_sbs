@@ -1,3 +1,7 @@
+
+import pytest
+
+pytest.importorskip("jax", reason="Requires the jax extra: uv sync --extra jax")
 import json
 from pathlib import Path
 from types import SimpleNamespace

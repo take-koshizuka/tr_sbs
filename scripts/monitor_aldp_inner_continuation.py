@@ -43,7 +43,7 @@ def submit_cases(campaign,plan,python,source_sha):
         log=campaign/'logs'/f'aldp-inner-{name}-%j.out';log.parent.mkdir(parents=True,exist_ok=True)
         command=['sbatch','--parsable',f'--job-name=aldp-inner-{name}','--partition=gpu',
             '--gres=gpu:1','--cpus-per-task=4','--mem=32G','--time=06:00:00',
-            '--exclude=htc-gpu024',f'--output={log}',str(ROOT/'exec_aldp_inner_continuation.sh'),
+            '--exclude=htc-gpu024',f'--output={log}',str(ROOT/'scripts/slurm/exec_aldp_inner_continuation.sh'),
             str(ROOT),str(python),str(campaign),name]
         write_json(intent,dict(status='dispatching',candidate=name,command=command,output=str(output)))
         job=execute(command).stdout.strip().split(';')[0]

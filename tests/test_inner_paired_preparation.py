@@ -1,10 +1,13 @@
 """Receipt-backed paired planning from the coupled u-short branch; no jobs."""
+
+import pytest
+
+pytest.importorskip("jax", reason="Requires the jax extra: uv sync --extra jax")
 from copy import deepcopy
 import json
 from pathlib import Path
 import sys
 
-import pytest
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
 from analyze_aldp_inner_curve import screen

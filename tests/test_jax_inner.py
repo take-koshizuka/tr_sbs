@@ -1,12 +1,15 @@
 """Small cross-framework tests; no ALDP construction or molecular evaluations."""
 
+import pytest
+
+pytest.importorskip("jax", reason="Requires the jax extra: uv sync --extra jax")
+
 from copy import deepcopy
 from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 import torch
 
 from tr_asbs.experiment.jax_inner import (

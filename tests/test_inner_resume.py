@@ -1,10 +1,13 @@
 """Exact uninterrupted versus resumed shared JAX fit on a tiny Gaussian."""
+
+import pytest
+
+pytest.importorskip("jax", reason="Requires the jax extra: uv sync --extra jax")
 from copy import deepcopy
 import random
 
 import jax
 import numpy as np
-import pytest
 import torch
 
 from test_jax_inner_curve import gaussian_shared_fit

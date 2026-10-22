@@ -66,14 +66,14 @@ fabric:
   loggers:
     _target_: wandb.integration.lightning.fabric.WandbLogger
     name: ${run_name}
-    entity: ml-takeshi-work
-    project: tr_asbs
+    entity: ${oc.env:WANDB_ENTITY,null}
+    project: ${oc.env:WANDB_PROJECT,tr_asbs}
     tags: ["${algorithm.name}"]
     save_dir: ${hydra:runtime.output_dir}
     group: null
     log_model: false
 
-wandb_mode: online
+wandb_mode: ${oc.env:WANDB_MODE,online}
 wandb_host: https://api.wandb.ai
 
 hydra:

@@ -51,7 +51,7 @@ def submit(campaign, plan, python, stage, candidate, rows):
     log.parent.mkdir(exist_ok=True)
     command=['sbatch','--parsable','--partition=gpu','--gres=gpu:1','--cpus-per-task=4',
         '--mem=32G','--exclude=htc-gpu024','--time='+('00:45:00' if stage=='smoke' else '3-00:00:00'),
-        '--job-name=aldp-'+key,'--output='+str(log),str(ROOT/'exec_aldp_noise_solver_grid.sh'),
+        '--job-name=aldp-'+key,'--output='+str(log),str(ROOT/'scripts/slurm/exec_aldp_noise_solver_grid.sh'),
         str(ROOT),str(python),str(campaign),stage,candidate]
     write_json(intent,dict(status='dispatching',command=command))
     job=execute(command).stdout.strip().split(';')[0]

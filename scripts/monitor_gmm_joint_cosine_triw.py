@@ -111,7 +111,7 @@ def submit_missing(
         result = run([
             "sbatch", "--parsable", f"--job-name={job_name}",
             f"--output={log_template}", f"--export={exports}",
-            str(repo / "exec_gmm_joint_cosine_triw.sh"),
+            str(repo / "scripts/slurm/exec_gmm_joint_cosine_triw.sh"),
         ], repo)
         job_id = result.stdout.strip().split(";")[0]
         if not job_id.isdigit():

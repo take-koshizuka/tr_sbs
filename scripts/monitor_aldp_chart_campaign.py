@@ -95,7 +95,7 @@ def submit(stage, candidates, campaign, plan, python, rows, dry_run=False):
         command = ['sbatch', '--parsable', f'--job-name={name}', '--partition=gpu', '--gres=gpu:1',
             '--cpus-per-task=4', '--mem=16G', '--time=02:00:00',
             '--exclude=htc-gpu024', f'--output={log_template}',
-            str(ROOT / 'exec_aldp_chart_campaign.sh'), str(ROOT), str(python),
+            str(ROOT / 'scripts/slurm/exec_aldp_chart_campaign.sh'), str(ROOT), str(python),
             str(campaign), stage, chart, str(seed)]
         if dry_run:
             new.append(dict(command=command, stage=stage, chart=chart, seed=seed))

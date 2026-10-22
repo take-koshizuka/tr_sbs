@@ -189,7 +189,7 @@ def main() -> None:
     if stage1_manifest is None:
         if args.advance:
             state["advanced"].append(
-                submit(["bash", "submit_gmm_score_triw_tuning_stage1.sh"], repo_root)
+                submit(["bash", "scripts/slurm/submit_gmm_score_triw_tuning_stage1.sh"], repo_root)
             )
         print(json.dumps(state, indent=2))
         return
@@ -231,7 +231,7 @@ def main() -> None:
                 submit(
                     [
                         "bash",
-                        "submit_gmm_score_triw_tuning_stage2.sh",
+                        "scripts/slurm/submit_gmm_score_triw_tuning_stage2.sh",
                         "--candidates",
                         str(candidates_path),
                     ],

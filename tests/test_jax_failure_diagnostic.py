@@ -1,11 +1,14 @@
 """Tiny numerical/replay checks; no ALDP construction or simulation."""
+
+import pytest
+
+pytest.importorskip("jax", reason="Requires the jax extra: uv sync --extra jax")
 from pathlib import Path
 import sys
 from types import MethodType
 
 import jax
 import numpy as np
-import pytest
 import torch
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))

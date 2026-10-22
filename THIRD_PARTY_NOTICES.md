@@ -1,9 +1,61 @@
 # Third-party notices
 
-## Alanine-dipeptide coordinate-transform reference
+## Vendored MACE source
 
-The minimum-energy alanine-dipeptide coordinates embedded in
-`src/tr_asbs/fab/aldp_transform_data.py` are derived from
+`src/mace/` is derived from [ACEsuit/mace](https://github.com/ACEsuit/mace).
+Its retained version string is `0.3.15`; the vendored tree contains local
+modifications and is not a byte-identical upstream release.
+
+Copyright (c) 2022 ACEsuit/mace
+
+The upstream MIT notice from
+[`v0.3.15/LICENSE.md`](https://github.com/ACEsuit/mace/blob/a2803e5e9eef71ee047d25addf584415ec0c0ca3/LICENSE.md),
+tag commit `a2803e5e9eef71ee047d25addf584415ec0c0ca3`, is copied verbatim to
+[`src/mace/MIT.md`](src/mace/MIT.md). This supplies the notice referenced by
+the existing MACE source headers. File-level and nested notices are retained.
+
+MACE contains components with their own attribution and license terms:
+
+| Vendored component | Attribution and provenance | Included license |
+| --- | --- | --- |
+| `src/mace/tools/torch_geometric/` | The [retained README](src/mace/tools/torch_geometric/README.md) identifies a modified PyTorch Geometric subset, copied through NequIP, and cites PyG 2.0.1. PyG: Copyright (c) 2021 Matthias Fey, Jiaxuan You. NequIP: Copyright (c) 2021 The President and Fellows of Harvard College. | [PyG MIT](licenses/PyG-2.0.1-MIT.txt), [NequIP MIT](licenses/NequIP-MIT.txt) |
+| `src/mace/tools/scatter.py` | Its header credits `mir-group/pytorch_runstats` and `rusty1s/pytorch_scatter`. Copyright (c) 2021 MIR@Harvard; Copyright (c) 2020 Matthias Fey. | [pytorch-runstats MIT](licenses/pytorch-runstats-MIT.txt), [torch-scatter MIT](licenses/torch-scatter-MIT.txt) |
+| `src/mace/tools/cg_cueq_tools.py` | Its header identifies modifications from NVIDIA cuEquivariance. Copyright (c) 2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0. | [Apache License 2.0](licenses/Apache-2.0.txt) |
+| `src/mace/tools/fairchem_dataset/lmdb_dataset_tools.py` | Its [retained notice](src/mace/tools/fairchem_dataset/fairchem_readme.md) identifies FairChem-derived code (Copyright (c) Meta, Inc. and its affiliates) and an ASE-derived LMDBDatabase component. The latter is identified there as LGPL 2.1. | [FairChem MIT](licenses/FairChem-MIT.txt), [GNU LGPL 2.1](licenses/LGPL-2.1.txt) |
+
+The graph subset is identified as MIT-licensed by its upstream projects;
+the Apache-2.0 header applies to the cuEquivariance-derived file. Original
+component commits are not recorded in the graph/scatter subset headers, so the
+following upstream versions document the included notices without asserting
+an exact import revision:
+
+- [PyTorch Geometric 2.0.1 license](https://github.com/pyg-team/pytorch_geometric/blob/2.0.1/LICENSE).
+- [NequIP v0.5.6 license](https://github.com/mir-group/nequip/blob/v0.5.6/LICENSE).
+- [torch-scatter 2.0.9 license](https://github.com/rusty1s/pytorch_scatter/blob/2.0.9/LICENSE).
+- [pytorch-runstats license](https://github.com/mir-group/pytorch_runstats/blob/main/LICENSE).
+- [FairChem license](https://github.com/FAIR-Chem/fairchem/blob/main/LICENSE.md).
+- [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0.txt).
+- [GNU LGPL 2.1](https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt),
+  corresponding to the [ASE license source](https://gitlab.com/ase/ase/-/blob/master/LICENSE)
+  linked by the retained component notice. The included text is copied from
+  the [SPDX license-text distribution](https://github.com/spdx/license-list-data/blob/main/text/LGPL-2.1-only.txt).
+
+Download locations and file checksums are recorded in
+[`licenses/SOURCES.md`](licenses/SOURCES.md).
+
+These source-code notices do not relicense separately downloaded pretrained
+weights or datasets. MACE foundation-model loaders retain their model-specific
+license messages.
+
+## Historical alanine-dipeptide coordinate-transform reference
+
+The following attribution is retained from an earlier coordinate-transform
+implementation. The named file `src/tr_asbs/fab/aldp_transform_data.py` is not
+present in the current source; the current IC pipeline loads external
+trajectory data for calibration.
+
+The retained historical notice identifies minimum-energy alanine-dipeptide
+coordinates in that file as derived from
 [`juliusberner/sde_sampler`](https://github.com/juliusberner/sde_sampler) at
 commit `06b553a3f4b0c592d6429fa2c309d47552accbfd`.
 

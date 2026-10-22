@@ -147,7 +147,7 @@ def submit(campaign, plan, python, rows, stage, candidate='', dry_run=False):
     command = ['sbatch', '--parsable', f'--job-name=aldp-mech-{label}', '--partition=gpu',
         '--gres=gpu:1', '--cpus-per-task=4', '--mem=16G', '--time=02:00:00',
         '--exclude=htc-gpu024', f'--output={log}', str(ROOT / plan.get(
-            'executor', 'exec_aldp_mechanism_campaign.sh')),
+            'executor', 'scripts/slurm/exec_aldp_mechanism_campaign.sh')),
         str(ROOT), str(python), str(campaign), stage, candidate or 'source_half', '0']
     if dry_run:
         return dict(command=command, stage=stage, candidate=candidate)

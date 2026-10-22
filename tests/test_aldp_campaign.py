@@ -62,6 +62,7 @@ def test_completed_job_receipt_does_not_accept_modified_output(tmp_path):
 
 def test_final_chart_rejection_keeps_all_raw_outputs_and_receipt(monkeypatch,tmp_path):
     """Exercise train_case's final-report path with the real strict chart, no MD."""
+    pytest.importorskip("mdtraj", reason="Requires the molecular extra: uv sync --extra molecular")
     from types import SimpleNamespace
     import numpy as np
     import torch
@@ -70,7 +71,7 @@ def test_final_chart_rejection_keeps_all_raw_outputs_and_receipt(monkeypatch,tmp
     import tr_asbs.process.chart_source as source_module
     import tr_asbs.utils.md_utils as md
     from tr_asbs.potential.internal_coordinate_chart import InternalCoordinateChart
-    sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scripts'))
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]/'scripts'))
     from run_aldp_chart_campaign import train_case,sha256
 
     transform=InternalCoordinateChart.from_state(dict(
@@ -89,7 +90,8 @@ def test_final_chart_rejection_keeps_all_raw_outputs_and_receipt(monkeypatch,tmp
         fit=lambda:None,global_step=2,model_capacity={},sampling_metadata=lambda:{},
         source=SimpleNamespace(sample=lambda _:y,log_prob=potential.log_prob),
         integrator=SimpleNamespace(run_with_logweights=lambda *_args,**_kwargs:
-            {'data_1':y,'log_Ph_Pref':torch.zeros(3)}))
+            {'data_1':y,'log_Ph_Pref':torch.zeros(3),
+             'log_Pref_Pu_det':torch.zeros(3)}))
     bank=dict(x=torch.zeros(3,3),phi_psi=torch.zeros(3,2),energies=torch.zeros(3))
     monkeypatch.setattr(trainer,'GammaASBSModule',lambda _:module)
     monkeypatch.setattr(source_module,'load_calibration_bundle',lambda _:

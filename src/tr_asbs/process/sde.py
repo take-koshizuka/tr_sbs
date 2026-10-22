@@ -4,13 +4,20 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Union, Tuple, Optional
+from typing import TYPE_CHECKING, Any, Union, Tuple, Optional
 
 import torch
 import torch.nn as nn
 from tr_asbs.utils.geometry import subtract_mean_batch, subtract_com_vector
-from mace.tools.torch_geometric import Batch
+if TYPE_CHECKING:
+    from mace.tools.torch_geometric import Batch
+else:
+    # Graph states are handled structurally below. Keep runtime annotation
+    # inspection usable without importing the optional atomistic stack.
+    Batch = Any
 
 DataType = Union[torch.Tensor, Batch]
 

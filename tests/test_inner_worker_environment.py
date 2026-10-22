@@ -31,7 +31,7 @@ def test_worker_discards_submission_platform(tmp_path, inherited_platform):
     env.pop('JAX_PLATFORMS', None)
     if inherited_platform is not None:
         env['JAX_PLATFORMS'] = inherited_platform
-    result = subprocess.run(['bash', str(root / 'exec_aldp_inner_continuation.sh'),
+    result = subprocess.run(['bash', str(root / 'scripts/slurm/exec_aldp_inner_continuation.sh'),
         str(root), str(mock_python), str(tmp_path / 'campaign'), 'u_short'],
         env=env, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr

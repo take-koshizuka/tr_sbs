@@ -89,7 +89,7 @@ def test_fabric_parameter_keys_roundtrip_through_delegated_loader():
 
 
 def test_worker_uses_only_diagnostic_entrypoint_and_unsets_jax():
-    text = (Path(__file__).resolve().parents[1]/'exec_aldp_scaled_backward_multistep.sh').read_text()
+    text = (Path(__file__).resolve().parents[1]/'scripts/slurm/exec_aldp_scaled_backward_multistep.sh').read_text()
     assert 'unset JAX_PLATFORMS' in text
     assert 'run_aldp_scaled_backward_multistep.py' in text
     assert 'train_case' not in text and '--advance' not in text

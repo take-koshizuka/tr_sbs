@@ -90,6 +90,7 @@ def test_native_rsync_partial_transfer_then_full_receipt_verification(tmp_path):
 def test_diagnostic_probe_uses_actual_receipt_verifier_and_zero_exit_audit(
         tmp_path,monkeypatch,capsys,exit_code):
     """Synthetic accounting/bytes only; these are not molecular results."""
+    pytest.importorskip("jax", reason="Requires the jax extra: uv sync --extra jax")
     import run_aldp_chart_campaign as worker
     from monitor_aldp_jax_inner_campaign import FIELDS
     code=tmp_path/'code';campaign=tmp_path/'results'

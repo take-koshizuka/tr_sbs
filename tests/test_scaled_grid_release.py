@@ -1,7 +1,10 @@
+
+import pytest
+
+pytest.importorskip("jax", reason="Requires the jax extra: uv sync --extra jax")
 import json
 from types import SimpleNamespace
 
-import pytest
 
 import aldp_scaled_release as release
 from run_aldp_chart_campaign import sha256

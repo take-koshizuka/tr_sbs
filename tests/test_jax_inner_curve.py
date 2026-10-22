@@ -1,4 +1,8 @@
 """Normal asymmetric accounting and actual tiny shared-loop JAX lifecycle."""
+
+import pytest
+
+pytest.importorskip("jax", reason="Requires the jax extra: uv sync --extra jax")
 from copy import deepcopy
 from pathlib import Path
 import sys

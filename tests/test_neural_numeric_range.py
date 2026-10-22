@@ -1,10 +1,13 @@
 """Small finite-range regressions; no molecular simulations or large models."""
+
+import pytest
+
+pytest.importorskip("jax", reason="Requires the jax extra: uv sync --extra jax")
 from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
 import torch
 
 from tr_asbs.experiment.jax_inner import AdamSpec,adam_init,adam_update,straight_through_clip

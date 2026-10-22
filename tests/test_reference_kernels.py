@@ -276,6 +276,7 @@ def test_buffer_metadata_rejects_old_or_changed_kernel():
 
 
 def test_graph_kernel_matches_particle_subspace_and_variable_batch_sizes():
+    pytest.importorskip("e3nn", reason="Requires the chem extra: uv sync --extra chem")
     from mace.tools.torch_geometric import Batch
     from mace.tools.torch_geometric.data import Data
     from tr_asbs.process.integrator import AtomicExponentialIntegrator

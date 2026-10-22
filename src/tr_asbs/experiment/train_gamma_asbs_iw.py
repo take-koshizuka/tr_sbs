@@ -1652,7 +1652,7 @@ class GammaASBSModule:
                 ckpt_path = Path(self.checkpoint_directory) / f"{name}_best.pt"
                 if not ckpt_path.is_file():
                     raise FileNotFoundError(f"Selected checkpoint is missing: {ckpt_path}")
-                ckpt = torch.load(ckpt_path, map_location="cpu")
+                ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
                 info = ckpt["_checkpoint"]
                 status = info["status"]
                 self.sde.load_state_dict(ckpt["fbsde"])
@@ -1980,6 +1980,7 @@ def main(cfg: DictConfig) -> None:
     logger_target = str(getattr(cfg.fabric.loggers, "_target_", "")).lower()
     use_wandb_logger = "wandb" in logger_target
     if use_wandb_logger:
+        os.environ["WANDB_MODE"] = str(cfg.wandb_mode)
         os.environ["WANDB_BASE_URL"] = str(cfg.wandb_host)
     torch.set_float32_matmul_precision("high")
     trainer = GammaASBSModule(cfg)

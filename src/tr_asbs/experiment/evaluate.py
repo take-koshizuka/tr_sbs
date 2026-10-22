@@ -131,7 +131,7 @@ class GammaASBSEvaluator:
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Best checkpoint not found: {ckpt_path}")
 
-        ckpt = torch.load(ckpt_path, map_location="cpu")
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
         if "fbsde" not in ckpt:
             raise KeyError(f"{best_filename} does not contain 'fbsde'. Keys={list(ckpt.keys())}")
 

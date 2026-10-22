@@ -31,7 +31,7 @@ def submit(campaign, plan, python, source_sha):
     command = ["sbatch", "--parsable", "--job-name=aldp-jax-inner", "--partition=gpu",
         "--gres=gpu:1", "--cpus-per-task=4", "--mem=32G", "--time=00:30:00",
         "--exclude=htc-gpu024", f"--output={log}",
-        str(ROOT / "exec_aldp_jax_inner_preflight.sh"), str(ROOT), str(python), str(campaign)]
+        str(ROOT / "scripts/slurm/exec_aldp_jax_inner_preflight.sh"), str(ROOT), str(python), str(campaign)]
     write_json(intent, dict(status="dispatching", command=command, output=str(output)))
     result = execute(command)
     job = result.stdout.strip().split(";")[0]

@@ -774,7 +774,7 @@ class ASBSModule:
 
         for name in self.ckpts.keys():
             ckpt_path = Path(self.checkpoint_directory) / f"{name}_best.pt"
-            ckpt = torch.load(ckpt_path, map_location="cpu")
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             info = ckpt["_checkpoint"]
             step = info["status"]["step"]
             best_val = info["status"]["value"]

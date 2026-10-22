@@ -52,6 +52,13 @@ __MACOSX/
 # Generated plots/snapshots
 /snapshot_figures/
 
+# Local campaign receipts and frozen source copies stay on disk. The small,
+# committed GMM comparison remains part of the public reproduction package.
+/reports/*
+!/reports/gmm_scorefree_six_methods/
+/slurm_logs/
+/aldp_visualizations/
+
 # NFS silly-rename artifacts (leftover from a file deleted while another
 # process still had it open -- not real files, never meaningful to track)
 .nfs*

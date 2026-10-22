@@ -1079,7 +1079,7 @@ class GammaASBSModule:
 
         for name in self.ckpts.keys():
             ckpt_path = Path(self.checkpoint_directory) / f"{name}_best.pt"
-            ckpt = torch.load(ckpt_path, map_location="cpu")
+            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             info = ckpt["_checkpoint"]
             step = info["status"]["step"]
             best_val = info["status"]["value"]
@@ -1220,6 +1220,7 @@ def main(cfg: DictConfig) -> None:
     logger_target = str(getattr(cfg.fabric.loggers, "_target_", "")).lower()
     use_wandb_logger = "wandb" in logger_target
     if use_wandb_logger:
+        os.environ["WANDB_MODE"] = str(cfg.wandb_mode)
         os.environ["WANDB_BASE_URL"] = str(cfg.wandb_host)
     torch.set_float32_matmul_precision("high")
     trainer = GammaASBSModule(cfg)

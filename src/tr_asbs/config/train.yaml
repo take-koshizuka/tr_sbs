@@ -31,6 +31,7 @@ resume: false
 ema_decay: null
 ema_start_step: 0
 visualize: false
+log_ground_truth_figures: false
 monitor_modes: {}
 monitor_initial_state: true
 keep_best_checkpoints: true
@@ -51,6 +52,7 @@ divergence_early_stop:
 # behavior exactly). See train_gamma_asbs_iw.py's GammaASBSModule.__init__ and
 # compute_corrector_gamma() for what "reuse_u_gamma"/"independent" do.
 corrector_gamma_mode: none
+initial_adjoint_matching_epochs: null  # First-u duration; later u phases stay fixed.
 corrector_trust_region_bound: null
 adjoint_buffer_duplicates: 1
 checkpoint_group_id: null
@@ -62,6 +64,25 @@ gamma_floor: 0.0
 # from two different (u, h) snapshots (see train_gamma_asbs_iw.py's
 # inner_loop_u for the exact rationale).
 clear_adjoint_buffer_per_outer_loop: false
+bc_loss_weight: legacy
+fc_loss_mode: cross_entropy
+fc_loss_weight: legacy
+bridge_time_epsilon: 0.001
+allow_legacy_checkpoint: false
+# Opt-in modular references/solvers; null keeps experiment's legacy config.
+reference_preset: null
+reference_solver: null
+reference_variance: null
+reference_steps: 128
+reference_grid: uniform_t
+reference_g_min: 0.1
+reference_g_max: 1.0
+reference_noise_knots: 128
+reference_edm_rho: 7.0
+reference_rate: 1.0
+vp_beta_min: 0.1
+vp_beta_max: 2.0
+reference_control_evaluation: left
 
 # backward loss defaults (used by train_general_asbs_iw.py)
 backward_loss_mode: score_matching

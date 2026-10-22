@@ -452,7 +452,8 @@ class SingleGaussian(BaseEnergy):
         self._plot_bound = 10.0
 
         # --- 以下は元の実装と同様 ---
-        if (source is not None) and (base_sde is not None):
+        from tr_asbs.process.sde import ZeroDriftSDE
+        if (source is not None) and isinstance(base_sde, ZeroDriftSDE):
             self.GaussianSB = GaussianSB(
                 source.mean, source.cov, 
                 mean, Sigma, 

@@ -11,7 +11,8 @@ class Boltzmann(nf.distributions.PriorDistribution):
     """
     Boltzmann distribution using OpenMM to get energy and forces
     """
-    def __init__(self, sim_context, temperature, energy_cut, energy_max):
+    def __init__(self, sim_context, temperature, energy_cut, energy_max,
+                 energy_mode='regularized'):
         """
         Constructor
         :param sim_context: Context of the simulation object used for energy
@@ -23,14 +24,15 @@ class Boltzmann(nf.distributions.PriorDistribution):
         self.temperature = temperature
         self.energy_cut = torch.tensor(energy_cut)
         self.energy_max = torch.tensor(energy_max)
+        self.energy_mode = omi.validate_energy_mode(energy_mode)
 
         # Set up functions
         self.openmm_energy = omi.OpenMMEnergyInterface.apply
         self.regularize_energy = omi.regularize_energy
 
-        self.norm_energy = lambda pos: self.regularize_energy(
+        self.norm_energy = lambda pos: omi.apply_energy_mode(
             self.openmm_energy(pos, self.sim_context, temperature)[:, 0],
-            self.energy_cut, self.energy_max)
+            self.energy_cut, self.energy_max, self.energy_mode)
 
     def log_prob(self, z):
         return -self.norm_energy(z)
@@ -41,7 +43,8 @@ class TransformedBoltzmann(nn.Module):
     Boltzmann distribution with respect to transformed variables,
     uses OpenMM to get energy and forces
     """
-    def __init__(self, sim_context, temperature, energy_cut, energy_max, transform):
+    def __init__(self, sim_context, temperature, energy_cut, energy_max, transform,
+                 energy_mode='regularized'):
         """
         Constructor
         :param sim_context: Context of the simulation object used for energy
@@ -57,14 +60,15 @@ class TransformedBoltzmann(nn.Module):
         self.temperature = temperature
         self.energy_cut = torch.tensor(energy_cut)
         self.energy_max = torch.tensor(energy_max)
+        self.energy_mode = omi.validate_energy_mode(energy_mode)
 
         # Set up functions
         self.openmm_energy = omi.OpenMMEnergyInterface.apply
         self.regularize_energy = omi.regularize_energy
 
-        self.norm_energy = lambda pos: self.regularize_energy(
+        self.norm_energy = lambda pos: omi.apply_energy_mode(
             self.openmm_energy(pos, self.sim_context, temperature)[:, 0],
-            self.energy_cut, self.energy_max)
+            self.energy_cut, self.energy_max, self.energy_mode)
 
         self.transform = transform
 
@@ -78,7 +82,8 @@ class BoltzmannParallel(nf.distributions.PriorDistribution):
     Boltzmann distribution using OpenMM to get energy and forces and processes the
     batch of states in parallel
     """
-    def __init__(self, system, temperature, energy_cut, energy_max, n_threads=None):
+    def __init__(self, system, temperature, energy_cut, energy_max, n_threads=None,
+                 energy_mode='regularized'):
         """
         Constructor
         :param system: Molecular system
@@ -93,6 +98,7 @@ class BoltzmannParallel(nf.distributions.PriorDistribution):
         self.temperature = temperature
         self.energy_cut = torch.tensor(energy_cut)
         self.energy_max = torch.tensor(energy_max)
+        self.energy_mode = omi.validate_energy_mode(energy_mode)
         self.n_threads = mp.cpu_count() if n_threads is None else n_threads
 
         # Create pool for parallel processing
@@ -103,9 +109,9 @@ class BoltzmannParallel(nf.distributions.PriorDistribution):
         self.openmm_energy = omi.OpenMMEnergyInterfaceParallel.apply
         self.regularize_energy = omi.regularize_energy
 
-        self.norm_energy = lambda pos: self.regularize_energy(
+        self.norm_energy = lambda pos: omi.apply_energy_mode(
             self.openmm_energy(pos, self.pool)[0][:, 0],
-            self.energy_cut, self.energy_max)
+            self.energy_cut, self.energy_max, self.energy_mode)
         
     def close(self):
         pool = getattr(self, "pool", None)
@@ -132,7 +138,7 @@ class TransformedBoltzmannParallel(nn.Module):
     states in parallel
     """
     def __init__(self, system, temperature, energy_cut, energy_max, transform,
-                 n_threads=None):
+                 n_threads=None, energy_mode='regularized'):
         """
         Constructor
         :param system: Molecular system
@@ -149,6 +155,7 @@ class TransformedBoltzmannParallel(nn.Module):
         self.temperature = temperature
         self.energy_cut = torch.tensor(energy_cut)
         self.energy_max = torch.tensor(energy_max)
+        self.energy_mode = omi.validate_energy_mode(energy_mode)
         self.n_threads = mp.cpu_count() if n_threads is None else n_threads
 
         # Create pool for parallel processing
@@ -159,9 +166,9 @@ class TransformedBoltzmannParallel(nn.Module):
         self.openmm_energy = omi.OpenMMEnergyInterfaceParallel.apply
         self.regularize_energy = omi.regularize_energy
 
-        self.norm_energy = lambda pos: self.regularize_energy(
+        self.norm_energy = lambda pos: omi.apply_energy_mode(
             self.openmm_energy(pos, self.pool)[0][:, 0],
-            self.energy_cut, self.energy_max)
+            self.energy_cut, self.energy_max, self.energy_mode)
 
         self.transform = transform
     

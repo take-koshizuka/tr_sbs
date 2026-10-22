@@ -1,0 +1,168 @@
+root: /scratch/htc/tkoshizuka/aldp_chart_20261007_5a093a95/physical_jax_inner_curve_v4/results/normal_inner_curve/seed0
+seed: 0
+curriculum: null
+log_loss_interval_step: 10
+log_detail_interval_epoch: 250
+checkpoint_directory: /scratch/htc/tkoshizuka/aldp_chart_20261007_5a093a95/physical_jax_inner_curve_v4/results/normal_inner_curve/seed0/checkpoints
+save_checkpoint_interval_epoch: 10000
+pretrained_controller_checkpoint: null
+eval_samples: 64
+eval_samples_final: 1024
+save_samples: false
+sample_directory: /scratch/htc/tkoshizuka/aldp_chart_20261007_5a093a95/physical_jax_inner_curve_v4/results/normal_inner_curve/seed0/samples
+save_sample_interval_epoch: 20
+progress_bar: false
+num_workers: 0
+compile: false
+resume: false
+ema_decay: null
+ema_start_step: 0
+visualize: false
+log_ground_truth_figures: false
+monitor_modes: {}
+monitor_initial_state: true
+keep_best_checkpoints: true
+divergence_early_stop:
+  enabled: false
+  primary_metric: loss/SD
+  secondary_metric: loss/tvd_soft
+  min_evals: 20
+  primary_factor: 2.0
+  secondary_delta: 0.15
+  patience: 8
+  nonfinite_patience: 2
+corrector_gamma_mode: none
+initial_adjoint_matching_epochs: null
+corrector_trust_region_bound: null
+adjoint_buffer_duplicates: 1
+checkpoint_group_id: fixed
+per_time_anchor_target: true
+gamma_floor: 0.0
+clear_adjoint_buffer_per_outer_loop: true
+bc_loss_weight: legacy
+fc_loss_mode: log_variance
+fc_loss_weight: legacy
+bridge_time_epsilon: 0.001
+allow_legacy_checkpoint: false
+reference_preset: null
+reference_solver: null
+reference_variance: null
+reference_steps: 128
+reference_grid: uniform_t
+reference_g_min: 0.1
+reference_g_max: 1.0
+reference_noise_knots: 128
+reference_edm_rho: 7.0
+reference_rate: 1.0
+vp_beta_min: 0.1
+vp_beta_max: 2.0
+reference_control_evaluation: left
+backward_loss_mode: score_matching
+backward_loss_terms:
+- score_matching
+score_matching_weight: 1.0
+consistency_loss_weight: 0.0
+consistency_loss_full_path_weight: 0.0
+consistency_var_full_path_weight: 0.0
+fabric:
+  _target_: lightning.fabric.Fabric
+  accelerator: cuda
+  devices: 1
+  strategy: auto
+  num_nodes: 1
+  loggers:
+    _target_: lightning.pytorch.loggers.CSVLogger
+    save_dir: /scratch/htc/tkoshizuka/aldp_chart_20261007_5a093a95/physical_jax_inner_curve_v4/results/normal_inner_curve/seed0
+    name: csv
+wandb_host: https://api.wandb.ai
+wandb_mode: online
+name: seed0
+potential:
+  _target_: tr_asbs.potential.alanine_dipeptide_energy.AlanineDipeptideEnergyIC
+  dim: 60
+  transform_data_path: /home/htc/tkoshizuka/tr_asbs/data/alanine_dipeptide/val.h5
+  transform_max_frames: 4096
+  transform_stride: 100
+  transform_offset: 0
+  ref_samples_path: /home/htc/tkoshizuka/tr_asbs/data/alanine_dipeptide/val.h5
+  reference_max_frames: 4096
+  reference_stride: 50
+  reference_offset: 500000
+  coordinate_chart: euclidean
+  calibration_bundle_path: /scratch/htc/tkoshizuka/aldp_chart_20261007_5a093a95/physical_v1/results/preflight/calibration.pt
+  chart_key: low_density
+  energy_mode: physical
+ic_dim: 60
+gamma: 1.0
+gamma_schedule: trust_region
+trust_region_bound: 1.0
+iw_clip_value: 10
+max_outer_loops: 1
+adjoint_matching_epochs: 2000
+corrector_matching_epochs: 1000
+steps_per_epoch: 100
+train_batch_size: 64
+inference_batch_size: 64
+num_samples_for_dual_loss:
+- 32
+- 8
+monitor_values: []
+controller:
+  _target_: tr_asbs.model.mlp.FourierMLP
+  dim: 60
+  num_layers: 8
+  channels: 256
+  clip_norm: 100.0
+  time_coordinates: physical
+corrector:
+  _target_: tr_asbs.model.mlp.FourierMLP
+  dim: 60
+  num_layers: 8
+  channels: 256
+  clip_norm: 100.0
+  time_coordinates: physical
+controller_optimizer:
+  _target_: torch.optim.Adam
+  lr: 0.0001
+  weight_decay: 0.0
+corrector_optimizer:
+  _target_: torch.optim.Adam
+  lr: 0.0001
+  weight_decay: 0.0
+gradient_clip_val: 100.0
+adjoint_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 512
+corrector_buffer:
+  _target_: tr_asbs.data.buffer.BatchBuffer
+  max_size: 512
+initial_buffer_samples: 128
+buffer_samples_per_epoch: 128
+log_buffer_energy: false
+log_buffer_grad_norm: false
+source:
+  _target_: tr_asbs.process.chart_source.ChartMappedGaussianPrior
+  dim: 60
+  scale: 1.0
+  calibration_bundle_path: /scratch/htc/tkoshizuka/aldp_chart_20261007_5a093a95/physical_v1/results/preflight/calibration.pt
+  chart_key: low_density
+base_sde:
+  _target_: tr_asbs.process.reference.LinearGaussianReference
+  kind: ou
+  rate: 1.0
+  diffusion_scale: 0.499998999999
+integrator:
+  _target_: tr_asbs.process.integrator.LinearExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 200
+    rescale_t: null
+  grid: uniform_t
+  control_evaluation: left
+terminal_cost:
+  _target_: tr_asbs.process.terminal_cost.ASBSTerminalCost
+  grad_clip_val: 1000.0
+E_max: 10000.0
+corrector_matching_mode: full

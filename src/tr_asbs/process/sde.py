@@ -100,6 +100,17 @@ class ZeroDriftSDE(FwdBwdSDE, ABC):
     def reparametrize_time(self, time: torch.Tensor) -> torch.DoubleTensor:
         return self.diffsquare_integral(time) / self.total_variance
 
+    def inverse_variance(self, variance: torch.Tensor) -> torch.Tensor:
+        lo, hi = torch.zeros_like(variance), torch.ones_like(variance)
+        for _ in range(56):
+            mid = (lo + hi) / 2
+            left = self.diffsquare_integral(mid) < variance
+            lo, hi = torch.where(left, mid, lo), torch.where(left, hi, mid)
+        return (lo + hi) / 2
+
+    def adjoint_transport(self, time: torch.Tensor) -> torch.Tensor:
+        return torch.ones_like(time)
+
     @torch.no_grad()
     def sample_posterior(
         self,
@@ -133,7 +144,10 @@ class ZeroDriftSDE(FwdBwdSDE, ABC):
         
         mean = (1 - t_reparam) * data_0_pos + t_reparam * data_1_pos
         
-        pos_t = mean + std * self.randn_like(data_0_pos)
+        # Project noise using the original particle/graph layout, not the
+        # flattened bridge layout (which would mix samples when mean-free).
+        noise = self.randn_like(data_0).reshape(data_0_pos.shape)
+        pos_t = mean + std * noise
 
         if _is_graph_data(data_0):
             data_t = data_0.clone()
@@ -407,6 +421,10 @@ class ControlledFBSDE(ControlledSDE, FwdBwdSDE):
             if diff.dim() > 0:
                 diff = diff[data.batch]
             while diff.dim() < data.pos.dim():
+                diff = diff.unsqueeze(-1)
+
+        else:
+            while diff.dim() < data.dim():
                 diff = diff.unsqueeze(-1)
 
         control_term = diff * self.h_controller(time, data)

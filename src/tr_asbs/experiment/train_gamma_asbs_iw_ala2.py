@@ -58,6 +58,8 @@ class GammaASBSAtomicModule(GammaASBSModule):
     """Ala2 (ThermoAtomicData) counterpart of GammaASBSModule."""
 
     def __init__(self, cfg: DictConfig):
+        if getattr(cfg, "reference_preset", None) is not None or str(cfg.base_sde._target_).split(".")[-1] not in ("VESDE", "EDMSDE", "PISCosineSDE") or str(cfg.integrator._target_).split(".")[-1] not in ("AtomicExponentialIntegrator", "AtomicEulerMaruyamaIntegrator"):
+            raise ValueError("Atomic trainer losses support legacy references/solvers; use the flat GammaASBSModule for alanine internal coordinates")
         # Deliberately does NOT call GammaASBSModule.__init__ (or
         # ASBSModule.__init__ super().__init__ chains) -- the atomic
         # potential/source/base_sde instantiation calls differ from the
@@ -98,7 +100,7 @@ class GammaASBSAtomicModule(GammaASBSModule):
         self.iw_clip_value = cfg.iw_clip_value
 
         self.fc_loss_mode = getattr(cfg, "fc_loss_mode", "cross_entropy")
-        assert self.fc_loss_mode in ["cross_entropy", "log_variance"], (
+        assert self.fc_loss_mode == "cross_entropy", (
             "log_variance (adjoint_matching_log_variance_step) has not been "
             "ported to the atomic pipeline -- use cross_entropy."
         )

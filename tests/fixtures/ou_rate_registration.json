@@ -1,0 +1,41 @@
+{
+  "schema": "aldp_ou_rate_one_axis_registration_v1",
+  "candidate_rate": 0.5,
+  "control_rate": 1.0,
+  "control_job_id": "5210271",
+  "control_result_path": "/scratch/htc/tkoshizuka/aldp_chart_20261007_5a093a95/physical_jax_inner_curve_v4/results/normal_inner_curve/seed0/result.json",
+  "control_result_sha256": "4a0de8e0a79914c479ead725ce958fd37ff4270240b93f3e06723c824b44d771",
+  "normal_inner": {
+    "u_epochs": 2000,
+    "h_epochs": 1000,
+    "steps_per_epoch": 100,
+    "outer_loops": 1,
+    "seed": 0,
+    "optimizer_updates": 300000
+  },
+  "full_expected_OpenMM": 285376,
+  "full_cap_OpenMM": 320000,
+  "preflight_expected_OpenMM": 384,
+  "preflight_cap_OpenMM": 1024,
+  "prior_duration_study_paid_OpenMM": 1524800,
+  "decision_bank": "A",
+  "disclosure_bank": "B",
+  "test": "closed",
+  "physical_non_deterioration_limits": {
+    "JS_add": 0.01,
+    "energy_W2_ratio": 1.1,
+    "basin_TVD_add": 0.02,
+    "missing_mass_add": 0.02,
+    "contact_fraction_add": 0.02,
+    "near_cut_phi_add": 0.02,
+    "near_cut_psi_add": 0.02
+  },
+  "candidate_admission_requires": "all physical non-deterioration limits and improved A JS by >=.01 or improved A basin TVD by >=.02; nextouter confirmation before adoption",
+  "BC_RN_ESS_scope": "reference-dependent own objectives/weights disclosed; no frozen-rate1 BC bank gate or cross-reference raw loss substitution",
+  "fresh_full_training_required": true,
+  "cached_control_retraining_prohibited": true,
+  "fixed": "physical density/source/chart/LV/solver/noise/integrated variance/clip/batches/dual/original12prefix",
+  "rationale": "one factor2 lower OU confinement, no extra rate grid; preflight only now",
+  "geometry_admission": "not_established",
+  "global_inner_minimum": "not_established"
+}

@@ -116,13 +116,19 @@ def compute_torsion_klds(gen_dihedrals: torch.Tensor, ref_dihedrals: torch.Tenso
         results[f"kld_{key}"] = kld
     return results, gen_hists, ref_hists
 
-def compute_joint_W2(gen_samples, ref_samples, n_particles: int, spatial_dim: int) -> float:
+def compute_joint_W2(gen_samples, ref_samples, n_particles: int, spatial_dim: int,
+                     periodic: bool = False) -> float:
     """Phi-Psi 空間での Wasserstein-2 距離"""
     # angles計算を統合
     gen_angles = extract_phi_psi(compute_all_dihedrals(gen_samples, n_particles=n_particles, spatial_dim=spatial_dim))
     ref_angles = extract_phi_psi(compute_all_dihedrals(ref_samples, n_particles=n_particles, spatial_dim=spatial_dim))
     
-    M = torch.cdist(gen_angles, ref_angles)
+    if periodic:
+        delta = gen_angles[:, None, :] - ref_angles[None, :, :]
+        delta = torch.atan2(torch.sin(delta), torch.cos(delta))
+        M = delta.square().sum(-1).sqrt()
+    else:
+        M = torch.cdist(gen_angles, ref_angles)
     n, m = M.shape
     # ot.emd2 は平方コストを受け取るため M**2
     w2_sq = ot.emd2(torch.ones(n)/n, torch.ones(m)/m, M**2)

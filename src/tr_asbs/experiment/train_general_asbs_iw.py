@@ -54,6 +54,8 @@ class GeneralASBSModule:
 
     def __init__(self, cfg: DictConfig):
         super().__init__()
+        if getattr(cfg, "reference_preset", None) is not None or str(cfg.base_sde._target_).split(".")[-1] not in ("VESDE", "EDMSDE", "PISCosineSDE") or str(cfg.integrator._target_).split(".")[-1] not in ("ExponentialIntegrator", "EulerMaruyamaIntegrator"):
+            raise ValueError("GeneralASBS consistency losses use legacy kernels; use GammaASBSModule for new references/solvers")
         self.cfg = cfg
         random_hash = uuid.uuid4().hex[:8]
         self.group_id = str(stable_group_id(cfg, exclude=("name"))) + f"{random_hash}"

@@ -145,6 +145,24 @@ class OpenMMEnergyInterfaceParallel(torch.autograd.Function):
         return forces * grad_output, None, None
 
 
+def validate_energy_mode(energy_mode):
+    if energy_mode not in ('regularized', 'physical'):
+        raise ValueError('energy_mode must be regularized or physical')
+    return energy_mode
+
+
+def apply_energy_mode(energy, energy_cut, energy_max, energy_mode):
+    """Keep density regularization separate from any training-gradient clipping.
+
+    Physical mode returns the original dimensionless OpenMM energy and its
+    force-derived derivative, including nonfinite values for the caller to reject.
+    """
+    validate_energy_mode(energy_mode)
+    if energy_mode == 'physical':
+        return energy
+    return regularize_energy(energy, energy_cut, energy_max)
+
+
 def regularize_energy(energy, energy_cut, energy_max):
     # Cast inputs to same type
     energy_cut = energy_cut.type(energy.type())

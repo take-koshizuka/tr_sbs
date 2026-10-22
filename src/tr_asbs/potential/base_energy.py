@@ -104,11 +104,14 @@ class BaseEnergy:
     
     def log_details(self, results: dict, prefix="", visualize=True) -> dict:
         data_1 = results["data_1"]
-        loss_metrics = self.sample_loss(data_1)
+        reference_available = getattr(self, "reference_metrics_available", True)
+        loss_metrics = self.sample_loss(data_1) if reference_available else {}
         energy = -self.eval(data_1)
         loss_metrics.update({'neg_avg_energy': -energy.mean().item()})
-        loss_metrics.update(self.energy_dist_error(energy))
+        if reference_available:
+            loss_metrics.update(self.energy_dist_error(energy))
         log = {f'{prefix}loss/{key}': loss_metrics[key] for key in loss_metrics }
+        log[f'{prefix}eval/reference_metrics_available'] = float(reference_available)
         del loss_metrics, energy
         
         for name, value in results.items():
@@ -173,16 +176,19 @@ class BaseSymtheticEnergy(BaseEnergy):
         self.n_particles = n_particles
         
         # root = Path(os.path.abspath(__file__)).parent.parent.parent
-        ref_samples_np = np.load(Path(ref_samples_path), allow_pickle=True)
-        self.ref_samples = subtract_com_vector(
-            torch.tensor(ref_samples_np),
-            self.n_particles,
-            self.spatial_dim,
-        )
+        self.ref_samples = None
+        if ref_samples_path is not None:
+            ref_samples_np = np.load(Path(ref_samples_path), allow_pickle=True)
+            self.ref_samples = subtract_com_vector(
+                torch.tensor(ref_samples_np), self.n_particles, self.spatial_dim)
         
     @property
     def is_mean_free(self) -> bool:
         return True
+
+    @property
+    def reference_metrics_available(self) -> bool:
+        return self.ref_samples is not None
         
     def clipped_score(self, x: torch.Tensor, max_norm: float) -> torch.Tensor:
         grad_E = self.grad_E(x)
@@ -190,6 +196,8 @@ class BaseSymtheticEnergy(BaseEnergy):
         return subtract_com_vector(clipped_score, self.n_particles, self.spatial_dim)
         
     def sample(self, size: int | tuple) -> torch.Tensor:
+        if self.ref_samples is None:
+            raise RuntimeError("Reference samples are unavailable; quality metrics are not_evaluated")
         num_samples = size if isinstance(size, int) else sum(list(size))
         idxs = torch.randperm(len(self.ref_samples))[:num_samples]
         gt_samples = self.ref_samples[idxs]
@@ -207,7 +215,10 @@ class BaseSymtheticEnergy(BaseEnergy):
         return {"Eq-EMD2": float(eot_res)}
     
     def log_details(self, results: dict, prefix="", visualize=True) -> dict:
-        logs = super().log_details(results, prefix=prefix, visualize=visualize)
+        logs = super().log_details(results, prefix=prefix,
+                                   visualize=visualize and self.reference_metrics_available)
+        if not self.reference_metrics_available:
+            return logs
         pred_samples = results["data_1"]
         
         eot_metrics = self.eot_loss(pred_samples)

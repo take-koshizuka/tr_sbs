@@ -1,550 +1,374 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
+# All rights reserved. Licensed under LICENSE in the root directory.
+"""Gaussian-kernel integrators. Pure transitions also drive all path densities."""
 
 import math
 from abc import ABC, abstractmethod
-from typing import Callable, Optional, Union, Sequence, Dict, Any, Tuple
 
 import torch
-import torch.nn as nn
+from torch import nn
 from tqdm import tqdm
 
-from tr_asbs.process.sde import BaseSDE, ControlledFBSDE, FwdBwdSDE, DataType, _is_graph_data
-from tr_asbs.utils.geometry import subtract_com_vector, subtract_mean_batch
-from tr_asbs.utils.gaussian_utils import gaussian_log_prob
+from .sde import ControlledFBSDE, ZeroDriftSDE
+from .reference import LinearGaussianReference, positions, coefficient
+from .transition import GaussianTransition, project, with_positions
 
 
-def _get_device(data: DataType) -> torch.device:
-    return data.pos.device if _is_graph_data(data) else data.device
+def _get_device(data):
+    return positions(data).device
 
 
-def get_timesteps(
-    t0: torch.Tensor | float,
-    t1: torch.Tensor | float,
-    dt: torch.Tensor | float | None = None,
-    steps: int | None = None,
-    rescale_t: str | None = None,
-) -> torch.Tensor:
-    if not (steps is None) ^ (dt is None):
+def get_timesteps(t0, t1, dt=None, steps=None, rescale_t=None):
+    if (steps is None) == (dt is None):
         raise ValueError("Exactly one of dt and steps should be defined.")
-    if steps is None:
-        steps = int(math.ceil((t1 - t0) / dt))
-    else:
-        steps = steps + 1
-
-    if rescale_t is None:
-        return torch.linspace(t0, t1, steps=steps, dtype=torch.float)
-    elif rescale_t == "quad":
-        return torch.sqrt(
-            torch.linspace(t0, t1.square(), steps=steps, dtype=torch.float)
-        ).clip(max=t1)
+    start, end = float(t0), float(t1)
+    if end <= start or (dt is not None and float(dt) <= 0):
+        raise ValueError("Require t1 > t0 and positive dt")
+    intervals = (
+        int(steps) if steps is not None else math.ceil((end - start) / float(dt))
+    )
+    if intervals < 1:
+        raise ValueError("At least one interval is required")
+    fraction = torch.linspace(0, 1, intervals + 1)
+    if rescale_t == "quad":
+        fraction = fraction.sqrt()
     elif rescale_t == "cosine":
-        s = 0.008
-        pre_phase = torch.linspace(t0, t1, steps=steps, dtype=torch.float) / t1
-        phase = ((pre_phase + s) / (1 + s)) * torch.pi * 0.5
-        dts = torch.cos(phase) ** 4
-        dts = (dts / dts.sum()) * t1
-        dts_out = torch.concat(
-            (torch.tensor([t0], dtype=torch.float), torch.cumsum(dts, -1))
+        phase = (
+            (torch.arange(intervals, dtype=torch.float) / intervals + 0.008)
+            / 1.008
+            * torch.pi
+            / 2
         )
-        return dts_out
-    raise ValueError("Unknown timestep rescaling method.")
+        weights = phase.cos().pow(4)
+        fraction = torch.cat((weights.new_zeros(1), weights.cumsum(0) / weights.sum()))
+    elif rescale_t is not None:
+        raise ValueError("Unknown timestep rescaling method")
+    result = start + (end - start) * fraction
+    result[0], result[-1] = start, end
+    return result
 
 
 class BaseIntegrator(nn.Module, ABC):
-    """Base class for SDE integrators."""
-
-    def __init__(self, sde: BaseSDE, timesteps: torch.Tensor | None = None):
+    def __init__(self, sde, timesteps=None, steps=128, grid="uniform_t"):
         super().__init__()
         self.sde = sde
-        if timesteps is not None:
-            self.register_buffer("timesteps", timesteps)
+        self.grid = grid
+        if grid not in ("uniform_t", "uniform_tau"):
+            raise ValueError("grid must be uniform_t or uniform_tau")
+        if timesteps is None:
+            timesteps = get_timesteps(0, 1, steps=steps)
+        if grid == "uniform_tau":
+            base = self.reference
+            values = (
+                torch.linspace(
+                    0,
+                    1,
+                    len(timesteps),
+                    dtype=torch.double,
+                    device=base.total_variance.device,
+                )
+                * base.total_variance
+            )
+            timesteps = base.inverse_variance(values).float()
+            timesteps[0], timesteps[-1] = 0, 1
+        if not bool(torch.all(timesteps[1:] > timesteps[:-1])):
+            raise ValueError("Timesteps must be strictly increasing")
+        self.register_buffer("timesteps", timesteps)
+
+    @property
+    def reference(self):
+        return getattr(self.sde, "base_sde", self.sde)
+
+    def kernel_metadata(self):
+        return {
+            "schema": 2,
+            "solver": type(self).__name__,
+            "grid": self.grid,
+            "reference": type(self.reference).__name__,
+            "reference_parameters": {
+                k: v.detach().cpu().tolist()
+                for k, v in self.reference.state_dict().items()
+            },
+            "timesteps": self.timesteps.detach().cpu().tolist(),
+            "mean_free": self.sde.is_mean_free,
+            "control_units": "score",
+        }
 
     @abstractmethod
-    @torch.no_grad()
-    def step(
-        self,
-        data: DataType,
-        time: torch.Tensor,
-        dt: torch.Tensor,
-    ) -> Tuple[DataType, DataType]:
-        """Return (deterministic_next, stochastic_next) for one forward step."""
-        pass
+    def transition(self, data, time, dt, backward=False):
+        """Differentiable Gaussian transition; no random draws or in-place edits."""
 
-    
-    def _get_drift_diffusion(
-        self, data: DataType, t: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Helper to extract drift (mean) and diffusion (sigma) for log-prob calculations.
-        """
-        # This default implementation assumes self.sde has drift/diffusion methods.
-        # Override this if your architecture is different.
-        if hasattr(self.sde, "drift") and hasattr(self.sde, "diffusion"):
-            return self.sde.drift(t, data), self.sde.diffusion(t, data)
-        raise NotImplementedError(
-            "run_with_logweights requires _get_drift_diffusion or sde.drift/diffusion implementation."
+    @torch.no_grad()
+    def step(self, data, time, dt):
+        kernel = self.transition(data, time, dt)
+        return kernel.mean, kernel.sample()
+
+    @torch.no_grad()
+    def step_backward(self, data, time, dt):
+        kernel = self.transition(data, time, dt, backward=True)
+        return kernel.mean, kernel.sample()
+
+    def _apply_centering(self, data):
+        return with_positions(data, project(data, positions(data)))
+
+    def _rollout(
+        self,
+        data,
+        timesteps,
+        center_every_step,
+        zero_last_step_noise,
+        return_trajectory,
+        progress_bar,
+        backward,
+    ):
+        if center_every_step is None:
+            center_every_step = self.sde.is_mean_free
+        if center_every_step and not self.sde.is_mean_free:
+            raise ValueError("Centering changes full-space Gaussian support")
+        times = (self.timesteps if timesteps is None else timesteps).to(
+            _get_device(data)
         )
-        
+        if backward:
+            times = times.flip(0)
+        data = data.clone()
+        trajectory = [data]
+        iterator = range(len(times) - 1)
+        if progress_bar:
+            iterator = tqdm(
+                iterator, desc="sdeint_bwd" if backward else "sdeint_fwd", leave=False
+            )
+        for i in iterator:
+            dt = abs(times[i + 1] - times[i])
+            kernel = self.transition(data, times[i], dt, backward)
+            data = (
+                kernel.mean
+                if zero_last_step_noise and i == len(times) - 2
+                else kernel.sample()
+            )
+            if center_every_step:
+                data = self._apply_centering(data)
+            if return_trajectory:
+                trajectory.append(data)
+        return trajectory if return_trajectory else data
+
     @torch.no_grad()
     def run(
         self,
-        initial_data: DataType,
-        timesteps: torch.Tensor | None = None,
-        center_every_step: bool = True,
-        zero_last_step_noise: bool = False,
-        return_trajectory: bool = True,
-        progress_bar: bool = True,
-    ) -> Union[DataType, list[DataType]]:
-        """Integrate the SDE forward over a sequence of timesteps."""
-        if timesteps is None:
-            if not hasattr(self, "timesteps"):
-                raise ValueError("No timesteps provided and no default timesteps set.")
-            timesteps = self.timesteps
+        initial_data,
+        timesteps=None,
+        center_every_step=None,
+        zero_last_step_noise=False,
+        return_trajectory=True,
+        progress_bar=True,
+    ):
+        return self._rollout(
+            initial_data,
+            timesteps,
+            center_every_step,
+            zero_last_step_noise,
+            return_trajectory,
+            progress_bar,
+            False,
+        )
 
-        timesteps = timesteps.to(_get_device(initial_data))
-        data = initial_data.clone() if hasattr(initial_data, "clone") else initial_data
-
-        trajectory = [data] if return_trajectory else []
-
-        iterator = range(len(timesteps) - 1)
-        if progress_bar:
-            iterator = tqdm(iterator, desc="sdeint_fwd", leave=False)
-
-        for i in iterator:
-            dt = timesteps[i + 1] - timesteps[i]
-            deterministic_next, stochastic_next = self.step(data, time=timesteps[i], dt=dt)
-            data = deterministic_next if (zero_last_step_noise and i == len(timesteps) - 2) else stochastic_next
-            
-            # Center of Mass correction (optional)
-            if center_every_step:
-                data = self._apply_centering(data)
-
-            if return_trajectory:
-                trajectory.append(data) # Warning: careful with referencing mutable objects in list
-
-        return trajectory if return_trajectory else data
-
-    # ---------- Backward Run ----------
-    
-    # ---------- Utilities ----------
-    def _apply_centering(self, data: DataType):
-        """Helper to apply CoM centering."""
-        if _is_graph_data(data):
-            data = data.clone()
-            data.pos = subtract_mean_batch(data.pos, data.batch)
-            return data
-        return subtract_com_vector(data, data.shape[-2], data.shape[-1])
-        
-    @abstractmethod
-    @torch.no_grad()
-    def step_backward(
-        self,
-        data: DataType,
-        time: torch.Tensor,
-        dt: torch.Tensor,  # distinct from forward dt, usually positive magnitude
-    ) -> Tuple[DataType, DataType]:
-        """
-        Return (deterministic_prev, stochastic_prev) for one reverse step.
-        """
-        pass
-    
     @torch.no_grad()
     def run_backward(
         self,
-        final_data: DataType,
-        timesteps: torch.Tensor | None = None,
-        zero_last_step_noise: bool = False,
-        center_every_step: bool = True,
-        return_trajectory: bool = True,
-        progress_bar: bool = True,
-    ) -> Dict[str, Any]:
-        """Integrate the SDE backward (reverse time)."""
-        if timesteps is None:
-            if not hasattr(self, "timesteps"):
-                raise ValueError("No timesteps provided and no default timesteps set.")
-            timesteps = self.timesteps
-        
-        timesteps = timesteps.to(_get_device(final_data))
-        assert timesteps[0] < timesteps[-1], "Timesteps should be in ascending order."
-        # Reverse the timesteps
-        times = timesteps.flip(0)
-        
-        data = final_data # assume clone handling similar to run
-        trajectory = [data] if return_trajectory else []
+        final_data,
+        timesteps=None,
+        zero_last_step_noise=False,
+        center_every_step=None,
+        return_trajectory=True,
+        progress_bar=True,
+    ):
+        return self._rollout(
+            final_data,
+            timesteps,
+            center_every_step,
+            zero_last_step_noise,
+            return_trajectory,
+            progress_bar,
+            True,
+        )
+
+    @torch.no_grad()
+    def run_with_logweights(
+        self,
+        integrator,
+        prior_log_prob_fn,
+        target_log_prob_fn,
+        initial_data,
+        timesteps=None,
+        center_every_step=None,
+        zero_last_step_noise=False,
+        return_trajectory=False,
+        progress_bar=False,
+    ):
+        if zero_last_step_noise:
+            raise ValueError("Deterministic final steps have no Gaussian path density")
+        if center_every_step is None:
+            center_every_step = self.sde.is_mean_free
+        if center_every_step and not self.sde.is_mean_free:
+            raise ValueError(
+                "Centering changes full-space Gaussian support; set center_every_step=False"
+            )
+        times = (self.timesteps if timesteps is None else timesteps).to(
+            _get_device(initial_data)
+        )
+        data = initial_data
+        log_ref_h = prior_log_prob_fn(data)
+        log_ref_u = torch.zeros_like(log_ref_h)
+        kl_ref_u = torch.zeros_like(log_ref_h)
+        trajectory = [data]
         iterator = range(len(times) - 1)
         if progress_bar:
-            iterator = tqdm(iterator, desc="sdeint_bwd", leave=False)
-
-        for i in iterator:
-            t_current = times[i]
-            t_next = times[i+1] # This is actually 'previous' time in forward sense
-            dt = t_current - t_next # Positive magnitude > 0
-            
-            deterministic_prev, stochastic_prev = self.step_backward(data, time=t_current, dt=dt)
-            data = deterministic_prev if (zero_last_step_noise and i == len(times) - 2) else stochastic_prev
-
-            if center_every_step:
-                data = self._apply_centering(data)
-
-            if return_trajectory:
-                trajectory.append(data)
-
-        return trajectory if return_trajectory else data
-    
-    # ------ Run with Log Weights (Girsanov / Importance Sampling) ----------
-    @torch.no_grad()
-    def run_with_logweights(
-        self,
-        integrator: "BaseIntegrator", # The 'sde_uh' in original code
-        prior_log_prob_fn: Callable,
-        target_log_prob_fn: Callable,
-        initial_data: DataType,
-        timesteps: torch.Tensor | None = None,
-        center_every_step: bool = True,
-        zero_last_step_noise: bool = False,
-        return_trajectory: bool = False,
-        progress_bar: bool = False,
-    ) -> Dict[str, Any]:
-        """
-        Forward integration that calculates log-importance weights between 
-        this integrator (Reference) and another integrator (Target/Model).
-        """
-        if timesteps is None:
-            if not hasattr(self, "timesteps"):
-                raise ValueError("No timesteps provided.")
-            timesteps = self.timesteps
-
-        timesteps = timesteps.to(_get_device(initial_data))
-        data = initial_data
-        device = _get_device(data)
-
-        batch_size = initial_data.shape[0]
-        D = data.reshape(batch_size, -1).shape[1]
-        log_Pref_Ph = torch.zeros(batch_size, device=device) # log(P_ref / P_backward)
-        log_Pref_Pu = torch.zeros(batch_size, device=device) # log(P_ref / P_forward_model)
-        log_Pref_Pu_det = torch.zeros(batch_size, device=device) # Low variance version
-
-        trajectory = [data] if return_trajectory else []
-
-        log_Pref_Ph += prior_log_prob_fn(data)
-        iterator = range(len(timesteps) - 1)
-        
-        if progress_bar:
             iterator = tqdm(iterator, desc="sdeint", leave=False)
-
-        same_integrator = integrator is self
-        
         for i in iterator:
-            t = timesteps[i]
-            t_next = timesteps[i+1]
-            dt = t_next - t
-            # Single forward call for reference: deterministic and stochastic outcomes are returned together.
-            fwd_mean_ref, next_data_stochastic = self.step(data, time=t, dt=dt)
-            if same_integrator:
-                fwd_mean = fwd_mean_ref
-            else:
-                fwd_mean, _ = integrator.step(data.clone(), time=t, dt=dt)
-
-            is_last_step = i == len(timesteps) - 2
-            next_data = fwd_mean_ref if (zero_last_step_noise and is_last_step) else next_data_stochastic
-            
-            if center_every_step:
-                next_data = self._apply_centering(next_data)
-                
-            bwd_mean, _ = integrator.step_backward(next_data.clone(), time=t_next, dt=dt)
-            
-            # Perform the update
-            diff_sq = self.sde.base_sde.diffsquare_integral(t_next) - self.sde.base_sde.diffsquare_integral(t)
-            sigma_step = diff_sq.clamp(min=1e-20).sqrt()
-            fwd_ref_pos = fwd_mean_ref
-            fwd_pos = fwd_mean
-            next_pos = next_data
-            bwd_pos = bwd_mean
-            data_pos = data
-
-            diff_means = (fwd_ref_pos - fwd_pos).reshape(batch_size, D)
-            var_step = sigma_step.pow(2)
-            log_Pref_Pu_det += 0.5 * (diff_means.pow(2) / var_step).sum(dim=-1)
-            
-            if sigma_step.numel() == 1:
-                sigma_step_expand = torch.full((batch_size, D), sigma_step.item(), device=device)
-            else:
-                sigma_step_expand = sigma_step
-
-            # --- Method B: Log Likelihoods (High Variance / Check) ---
-            log_prob_ref_step = gaussian_log_prob(
-                next_pos.reshape(batch_size, D),
-                fwd_ref_pos.reshape(batch_size, D),
-                sigma_step_expand, 
-                D
+            t, tn = times[i], times[i + 1]
+            dt = tn - t
+            proposal = self.transition(data, t, dt)
+            model = (
+                proposal if self is integrator else integrator.transition(data, t, dt)
             )
-            log_prob_model_fwd_step = gaussian_log_prob(
-                next_pos.reshape(batch_size, D),
-                fwd_pos.reshape(batch_size, D),
-                sigma_step_expand, 
-                D
-            )
-            log_prob_model_bwd_step = gaussian_log_prob(
-                data_pos.reshape(batch_size, D),
-                bwd_pos.reshape(batch_size, D),
-                sigma_step_expand, 
-                D
-            )
-
-            log_Pref_Ph += (log_prob_ref_step - log_prob_model_bwd_step)
-            log_Pref_Pu += (log_prob_ref_step - log_prob_model_fwd_step)
-                
-            # Update state
-            data = next_data
+            nxt = proposal.sample()
+            reverse = integrator.transition(nxt, tn, dt, backward=True)
+            log_p = proposal.log_prob(nxt)
+            log_ref_h = log_ref_h + log_p - reverse.log_prob(data)
+            log_ref_u = log_ref_u + log_p - model.log_prob(nxt)
+            kl_ref_u = kl_ref_u + proposal.kl(model)
+            data = nxt
             if return_trajectory:
                 trajectory.append(data)
+        terminal_log_prob = target_log_prob_fn(data)
+        return dict(
+            data_1=data,
+            trajectory=trajectory if return_trajectory else [initial_data, data],
+            log_Ph_Pref=terminal_log_prob - log_ref_h,
+            target_log_prob=terminal_log_prob,
+            log_Pu_Pref=-log_ref_u,
+            log_Pref_Pu_det=kl_ref_u,
+            kernel_metadata=self.kernel_metadata(),
+        )
 
-        # Final Target Log Prob subtraction
-        target_log_prob = target_log_prob_fn(data)
-        log_Pref_Ph -= target_log_prob
-
-        return {
-            "data_1": data,
-            "trajectory": trajectory if return_trajectory else [initial_data, data],
-            "log_Ph_Pref": -log_Pref_Ph,
-            "log_Pu_Pref": -log_Pref_Pu,
-            "log_Pref_Pu_det": log_Pref_Pu_det,
-        }
 
 class EulerMaruyamaIntegrator(BaseIntegrator):
-    """Euler-Maruyama integrator for SDEs."""
+    """Physical-time Euler with its own endpoint g^2 dt covariance."""
 
-    @torch.no_grad()
-    def step(
-        self,
-        data: DataType,
-        time: torch.Tensor,  # scalar
-        dt: torch.Tensor,  # scalar
-    ) -> Tuple[DataType, DataType]:
-        """Return deterministic and stochastic next states for Euler-Maruyama."""
-        drift = self.sde.drift(time, data) * dt
-        diffusion = self.sde.diffusion(time) * dt.sqrt() * self.sde.randn_like(data)
-        deterministic_next = data + drift
-        stochastic_next = deterministic_next + diffusion
-        return deterministic_next, stochastic_next
-    
+    def transition(self, data, time, dt, backward=False):
+        drift = (
+            self.sde.bwd_drift(time, data) if backward else self.sde.drift(time, data)
+        )
+        mean = with_positions(data, positions(data) + coefficient(dt, data) * drift)
+        variance = self.sde.diffusion(time).square() * dt
+        return GaussianTransition(mean, variance, self.sde.is_mean_free)
+
+
 class ExponentialIntegrator(BaseIntegrator):
-    """Exponential integrator for SDEs."""
+    """Legacy exact-noise Euler: endpoint drift dt, integrated Brownian noise.
 
-    @torch.no_grad()
-    def step(
-        self,
-        data: DataType,
-        time: torch.Tensor,  # scalar
-        dt: torch.Tensor,  # scalar
-    ) -> Tuple[DataType, DataType]:
-        """Return deterministic and stochastic next states for exponential integrator."""
-        drift = self.sde.drift(time, data) * dt
-        diff_sq = self.sde.base_sde.diffsquare_integral(time + dt) - self.sde.base_sde.diffsquare_integral(time)
-        diffusion = diff_sq.sqrt() * self.sde.randn_like(data)
-        deterministic_next = data + drift
-        stochastic_next = deterministic_next + diffusion
-        return deterministic_next, stochastic_next
-    
-    @torch.no_grad()
-    def step_backward(
-        self,
-        data: DataType,
-        time: torch.Tensor,  # scalar
-        dt: torch.Tensor,  # scalar
-    ) -> Tuple[DataType, DataType]:
-        """Return deterministic and stochastic previous states for reverse exponential step."""
-        if isinstance(self.sde, ControlledFBSDE):
-            # Piecewise schedules need the coefficient of the interval being
-            # traversed, while continuous schedules retain their old right-
-            # endpoint drift convention via backward_step_diffusion().
-            bwd_drift = self.sde.bwd_drift(time, data, interval_dt=dt)
-        else:
-            bwd_drift = self.sde.bwd_drift(time, data)
-        drift = (-bwd_drift) * (-dt)
-        diff_sq = self.sde.base_sde.diffsquare_integral(time) - self.sde.base_sde.diffsquare_integral(time - dt)
-        diffusion = diff_sq.sqrt() * self.sde.randn_like(data)
-        deterministic_prev = data + drift
-        stochastic_prev = deterministic_prev + diffusion
-        return deterministic_prev, stochastic_prev
-
-
-class AtomicIntegratorMixin:
-    """Shared graph-batch (ThermoAtomicData) overrides for the Girsanov
-    log-weight (run_with_logweights) bookkeeping used by the gamma dual-solve.
-
-    Assumes a HOMOGENEOUS batch (every graph has the same number of atoms --
-    true for a fixed single-molecule system like Ala2), so per-graph atomic
-    coordinates can be safely reshaped to a flat (batch_size, D) feature
-    vector for the log-density math -- mirroring the existing flat-tensor
-    run_with_logweights exactly, just extracting/reinserting .pos from/into
-    a ThermoAtomicData shell at each step instead of operating on a raw
-    tensor throughout.
+    This historical name is retained for configs/checkpoints. It is not an
+    exponential OU solver and does not integrate the control in diffusion time.
     """
 
-    @torch.no_grad()
-    def run_with_logweights(
-        self,
-        integrator: "BaseIntegrator",
-        prior_log_prob_fn: Callable,
-        target_log_prob_fn: Callable,
-        initial_data: DataType,
-        timesteps: torch.Tensor | None = None,
-        center_every_step: bool = True,
-        zero_last_step_noise: bool = False,
-        return_trajectory: bool = False,
-        progress_bar: bool = False,
-    ) -> Dict[str, Any]:
-        if timesteps is None:
-            if not hasattr(self, "timesteps"):
-                raise ValueError("No timesteps provided.")
-            timesteps = self.timesteps
+    def transition(self, data, time, dt, backward=False):
+        if not isinstance(self.reference, ZeroDriftSDE):
+            raise ValueError(
+                "Legacy ExponentialIntegrator requires a zero-drift reference"
+            )
+        if backward:
+            drift = (
+                self.sde.bwd_drift(time, data, interval_dt=dt)
+                if isinstance(self.sde, ControlledFBSDE)
+                else self.sde.bwd_drift(time, data)
+            )
+            variance = self.reference.diffsquare_integral(
+                time
+            ) - self.reference.diffsquare_integral(time - dt)
+        else:
+            drift = self.sde.drift(time, data)
+            variance = self.reference.diffsquare_integral(
+                time + dt
+            ) - self.reference.diffsquare_integral(time)
+        mean = with_positions(data, positions(data) + coefficient(dt, data) * drift)
+        return GaussianTransition(mean, variance, self.sde.is_mean_free)
 
-        timesteps = timesteps.to(initial_data.pos.device)
-        data = initial_data
-        device = data.pos.device
 
-        batch_size = data.num_graphs
-        atoms_per_graph = data.pos.shape[0] // batch_size
-        D = atoms_per_graph * data.pos.shape[1]
+class DiffusionTimeEulerIntegrator(BaseIntegrator):
+    """Zero-drift reference, mean x + Delta V * score-unit control."""
 
-        log_Pref_Ph = torch.zeros(batch_size, device=device)
-        log_Pref_Pu = torch.zeros(batch_size, device=device)
-        log_Pref_Pu_det = torch.zeros(batch_size, device=device)
+    def transition(self, data, time, dt, backward=False):
+        if not isinstance(self.reference, ZeroDriftSDE):
+            raise ValueError("Diffusion-time Euler requires a zero-drift reference")
+        s, t = (time - dt, time) if backward else (time, time + dt)
+        variance = self.reference.diffsquare_integral(
+            t
+        ) - self.reference.diffsquare_integral(s)
+        name = "h_controller" if backward else "u_controller"
+        model = getattr(self.sde, name, None)
+        control = (
+            torch.zeros_like(positions(data)) if model is None else model(time, data)
+        )
+        mean = with_positions(
+            data, positions(data) + coefficient(variance, data) * control
+        )
+        return GaussianTransition(mean, variance, self.sde.is_mean_free)
 
-        trajectory = [data] if return_trajectory else []
 
-        log_Pref_Ph += prior_log_prob_fn(data)
-        iterator = range(len(timesteps) - 1)
+class LinearExponentialIntegrator(BaseIntegrator):
+    """Exact scalar linear propagation with frozen control or midpoint control.
 
-        if progress_bar:
-            iterator = tqdm(iterator, desc="sdeint", leave=False)
+    Midpoint is a deterministic two-stage control evaluation with the same exact
+    reference noise covariance. No second-order weak-accuracy claim is made.
+    """
 
-        same_integrator = integrator is self
+    def __init__(self, *args, control_evaluation="left", **kwargs):
+        super().__init__(*args, **kwargs)
+        if control_evaluation not in ("left", "midpoint"):
+            raise ValueError("control_evaluation must be left or midpoint")
+        self.control_evaluation = control_evaluation
 
-        for i in iterator:
-            t = timesteps[i]
-            t_next = timesteps[i + 1]
-            dt = t_next - t
-            fwd_mean_ref, next_data_stochastic = self.step(data, time=t, dt=dt)
-            if same_integrator:
-                fwd_mean = fwd_mean_ref
-            else:
-                fwd_mean, _ = integrator.step(data.clone(), time=t, dt=dt)
+    def kernel_metadata(self):
+        return dict(
+            super().kernel_metadata(), control_evaluation=self.control_evaluation
+        )
 
-            is_last_step = i == len(timesteps) - 2
-            next_data = fwd_mean_ref if (zero_last_step_noise and is_last_step) else next_data_stochastic
+    def transition(self, data, time, dt, backward=False):
+        if not isinstance(self.reference, LinearGaussianReference):
+            raise ValueError(
+                "Linear exponential solver requires LinearGaussianReference"
+            )
+        s, t = (time - dt, time) if backward else (time, time + dt)
+        phi, k, q = self.reference.transition_coefficients(s, t, backward)
+        name = "h_controller" if backward else "u_controller"
+        model = getattr(self.sde, name, None)
+        control = (
+            torch.zeros_like(positions(data)) if model is None else model(time, data)
+        )
+        if self.control_evaluation == "midpoint" and model is not None:
+            mid = (s + t) / 2
+            hs, ht = (mid, t) if backward else (s, mid)
+            hp, hk, _ = self.reference.transition_coefficients(hs, ht, backward)
+            predictor = with_positions(
+                data,
+                coefficient(hp, data) * positions(data)
+                + coefficient(hk, data) * control,
+            )
+            control = model(mid, predictor)
+        mean = with_positions(
+            data,
+            coefficient(phi, data) * positions(data) + coefficient(k, data) * control,
+        )
+        return GaussianTransition(mean, q, self.sde.is_mean_free)
 
-            if center_every_step:
-                next_data = self._apply_centering(next_data)
 
-            bwd_mean, _ = integrator.step_backward(next_data.clone(), time=t_next, dt=dt)
-
-            diff_sq = self.sde.base_sde.diffsquare_integral(t_next) - self.sde.base_sde.diffsquare_integral(t)
-            sigma_step = diff_sq.clamp(min=1e-20).sqrt()
-
-            fwd_ref_pos = fwd_mean_ref.pos.reshape(batch_size, D)
-            fwd_pos = fwd_mean.pos.reshape(batch_size, D)
-            next_pos = next_data.pos.reshape(batch_size, D)
-            bwd_pos = bwd_mean.pos.reshape(batch_size, D)
-            data_pos = data.pos.reshape(batch_size, D)
-
-            diff_means = fwd_ref_pos - fwd_pos
-            var_step = sigma_step.pow(2)
-            log_Pref_Pu_det += 0.5 * (diff_means.pow(2) / var_step).sum(dim=-1)
-
-            if sigma_step.numel() == 1:
-                sigma_step_expand = torch.full((batch_size, D), sigma_step.item(), device=device)
-            else:
-                sigma_step_expand = sigma_step
-
-            log_prob_ref_step = gaussian_log_prob(next_pos, fwd_ref_pos, sigma_step_expand, D)
-            log_prob_model_fwd_step = gaussian_log_prob(next_pos, fwd_pos, sigma_step_expand, D)
-            log_prob_model_bwd_step = gaussian_log_prob(data_pos, bwd_pos, sigma_step_expand, D)
-
-            log_Pref_Ph += (log_prob_ref_step - log_prob_model_bwd_step)
-            log_Pref_Pu += (log_prob_ref_step - log_prob_model_fwd_step)
-
-            data = next_data
-            if return_trajectory:
-                trajectory.append(data)
-
-        target_log_prob = target_log_prob_fn(data)
-        log_Pref_Ph -= target_log_prob
-
-        return {
-            "data_1": data,
-            "trajectory": trajectory if return_trajectory else [initial_data, data],
-            "log_Ph_Pref": -log_Pref_Ph,
-            "log_Pu_Pref": -log_Pref_Pu,
-            "log_Pref_Pu_det": log_Pref_Pu_det,
-        }
+# Public Hydra paths retained; graph batches now share the very same kernels.
+class AtomicIntegratorMixin:
+    pass
 
 
 class AtomicEulerMaruyamaIntegrator(AtomicIntegratorMixin, EulerMaruyamaIntegrator):
-    """Graph-batch (ThermoAtomicData) counterpart of EulerMaruyamaIntegrator."""
-
-    @torch.no_grad()
-    def step(
-        self, data: DataType, time: torch.Tensor, dt: torch.Tensor
-    ) -> Tuple[DataType, DataType]:
-        dtype = data.pos.dtype
-        drift = self.sde.drift(time, data) * dt
-        diffusion = self.sde.diffusion(time) * dt.sqrt() * self.sde.randn_like(data)
-        deterministic_next = data.clone()
-        deterministic_next.pos = (data.pos + drift).to(dtype)
-        stochastic_next = data.clone()
-        stochastic_next.pos = (deterministic_next.pos + diffusion).to(dtype)
-        return deterministic_next, stochastic_next
-
-    @torch.no_grad()
-    def step_backward(
-        self, data: DataType, time: torch.Tensor, dt: torch.Tensor
-    ) -> Tuple[DataType, DataType]:
-        dtype = data.pos.dtype
-        if hasattr(self.sde, "bwd_drift"):
-            drift = (-self.sde.bwd_drift(time, data)) * (-dt)
-        else:
-            drift = (-self.sde.drift(time, data)) * (-dt)
-        diffusion = self.sde.diffusion(time) * dt.sqrt() * self.sde.randn_like(data)
-        deterministic_prev = data.clone()
-        deterministic_prev.pos = (data.pos + drift).to(dtype)
-        stochastic_prev = data.clone()
-        stochastic_prev.pos = (deterministic_prev.pos + diffusion).to(dtype)
-        return deterministic_prev, stochastic_prev
+    pass
 
 
 class AtomicExponentialIntegrator(AtomicIntegratorMixin, ExponentialIntegrator):
-    """Graph-batch (ThermoAtomicData) counterpart of ExponentialIntegrator."""
-
-    @torch.no_grad()
-    def step(
-        self, data: DataType, time: torch.Tensor, dt: torch.Tensor
-    ) -> Tuple[DataType, DataType]:
-        dtype = data.pos.dtype
-        drift = self.sde.drift(time, data) * dt
-        diff_sq = self.sde.base_sde.diffsquare_integral(time + dt) - self.sde.base_sde.diffsquare_integral(time)
-        diffusion = diff_sq.sqrt() * self.sde.randn_like(data)
-        deterministic_next = data.clone()
-        deterministic_next.pos = (data.pos + drift).to(dtype)
-        stochastic_next = data.clone()
-        stochastic_next.pos = (deterministic_next.pos + diffusion).to(dtype)
-        return deterministic_next, stochastic_next
-
-    @torch.no_grad()
-    def step_backward(
-        self, data: DataType, time: torch.Tensor, dt: torch.Tensor
-    ) -> Tuple[DataType, DataType]:
-        dtype = data.pos.dtype
-        drift = (-self.sde.bwd_drift(time, data)) * (-dt)
-        diff_sq = self.sde.base_sde.diffsquare_integral(time) - self.sde.base_sde.diffsquare_integral(time - dt)
-        diffusion = diff_sq.sqrt() * self.sde.randn_like(data)
-        deterministic_prev = data.clone()
-        deterministic_prev.pos = (data.pos + drift).to(dtype)
-        stochastic_prev = data.clone()
-        stochastic_prev.pos = (deterministic_prev.pos + diffusion).to(dtype)
-        return deterministic_prev, stochastic_prev
+    pass

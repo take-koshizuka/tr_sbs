@@ -1,0 +1,33 @@
+# @package _global_
+defaults:
+  - gmm_mode
+  - _self_
+
+name: gmm_mode_score_triw
+
+score_conditioned_model:
+  _target_: tr_asbs.variational.TRIWScoreConditionedControl
+  dim: ${potential.dim}
+  num_steps: 128
+  num_layers: 2
+  num_hid: 64
+  outer_clip: 1.0e4
+  inner_clip: 1.0e2
+  weight_init: 1.0e-8
+  bias_init: 1.0
+
+# Interpolation replaces the inherited FourierMLP dictionaries instead of
+# recursively retaining their ``channels`` and ``clip_norm`` fields.
+controller: ${score_conditioned_model}
+corrector: ${score_conditioned_model}
+
+integrator:
+  _target_: tr_asbs.process.integrator.ExponentialIntegrator
+  timesteps:
+    _target_: tr_asbs.process.integrator.get_timesteps
+    t0: 0.0
+    t1: 1.0
+    steps: 128
+    rescale_t: null
+
+report_seed: 12345

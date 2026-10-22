@@ -28,6 +28,14 @@ class BatchBuffer(Dataset):
     def __init__(self, max_size: int):
         self.max_size = max_size
         self.storage: Dict[str, List[torch.Tensor]] = defaultdict(list)
+        self.metadata = None
+
+    def bind_metadata(self, metadata):
+        if self.metadata is None and len(self):
+            raise ValueError("Nonempty buffer has no kernel metadata; regenerate it")
+        if self.metadata is not None and self.metadata != metadata:
+            raise ValueError("Buffer kernel metadata differs; clear and regenerate it")
+        self.metadata = metadata
 
     def clear(self) -> None:
         """Drop all stored entries. Used to guarantee a buffer never mixes
@@ -39,6 +47,7 @@ class BatchBuffer(Dataset):
         valid since they're Radon-Nikodym derivatives against different
         reference measures."""
         self.storage = defaultdict(list)
+        self.metadata = None
 
     def extend(self, **kwargs: torch.Tensor) -> None:
         """Append batch tensors and split them into per-sample entries."""
@@ -84,10 +93,11 @@ class BatchBuffer(Dataset):
         return {key: value[idx] for key, value in self.storage.items()}
 
     def state_dict(self) -> Dict[str, Any]:
-        return {"storage": self.storage}
+        return {"storage": self.storage, "metadata": self.metadata}
 
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         self.storage = state_dict["storage"]
+        self.metadata = state_dict.get("metadata")
 
     @staticmethod
     def collate_fn(batch: Sequence[Mapping[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:

@@ -10,7 +10,7 @@ from tr_asbs.utils.geometry import subtract_mean_batch, subtract_com_vector
 #### EGNN: from https://github.com/jarridrb/DEM/blob/main/dem/models/components/egnn.py ####
 ############################################################################################
 
-def clip(tensor: torch.Tensor, max_norm: float | None = None):
+def clip(tensor: torch.Tensor, max_norm: float | None = None, gradient_mode="straight_through"):
     """Straight-through per-component clip: forward value is bounded to
     [-max_norm, max_norm] (numerical safety), but gradient flows as if
     unclipped. A plain torch.clip has exactly zero gradient beyond its
@@ -24,6 +24,8 @@ def clip(tensor: torch.Tensor, max_norm: float | None = None):
     fix + rationale in lennardjones_energy.py's _energy()."""
     if max_norm is not None:
         clipped = tensor.clip(min=-1.0 * max_norm, max=max_norm)
+        if gradient_mode == "exact":
+            return clipped
         tensor = tensor + (clipped - tensor).detach()
     return tensor
 
@@ -42,6 +44,7 @@ class EGNN_dynamics(nn.Module):
         agg="sum",
         compile=False,
         clip_norm: float | None = None,
+        clip_gradient_mode: str = "straight_through",
     ):
         super().__init__()
         
@@ -67,6 +70,9 @@ class EGNN_dynamics(nn.Module):
         # Count function calls
         self.counter = 0
         self.clip_norm = clip_norm
+        if clip_gradient_mode not in ("straight_through", "exact"):
+            raise ValueError("Invalid clip_gradient_mode")
+        self.clip_gradient_mode = clip_gradient_mode
         
     def _reshape_input(self, t: torch.Tensor, xs: torch.Tensor):
         """
@@ -161,7 +167,7 @@ class EGNN_dynamics(nn.Module):
         self.counter += 1
 
         if self.clip_norm is not None:
-            vel = clip(vel, max_norm=self.clip_norm)
+            vel = clip(vel, max_norm=self.clip_norm, gradient_mode=self.clip_gradient_mode)
             
         return vel.view(n_batch, self._n_particles, self._spatial_dim)
 

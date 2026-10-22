@@ -1,0 +1,22 @@
+# @package _global_
+defaults:
+  - ad_ic_gamma_asbs
+  - _self_
+
+name: ad_ic_reference
+# Gaussian kernels act on unconstrained y; the smooth chart maps y to one valid
+# IC domain and contributes its Jacobian. Sampling quality remains unvalidated.
+potential:
+  coordinate_chart: euclidean
+reference_preset: brownian_constant
+reference_variance: 0.249999  # Matches sigma_max^2-sigma_min^2 of legacy VE.
+reference_steps: 200
+reference_grid: uniform_t
+fc_loss_mode: path_kl
+bc_loss_weight: reference_variance
+corrector_gamma_mode: none
+clear_adjoint_buffer_per_outer_loop: true
+controller:
+  time_coordinates: variance
+corrector:
+  time_coordinates: variance

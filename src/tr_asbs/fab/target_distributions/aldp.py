@@ -3,6 +3,7 @@ from torch import nn
 import numpy as np
 
 from ..boltzgen import flows, distributions
+from ..boltzgen.openmm_interface import validate_energy_mode
 from simtk import openmm as mm
 from simtk import unit
 from simtk.openmm import app
@@ -18,7 +19,8 @@ class AldpBoltzmann(nn.Module, TargetDistribution):
                  ind_circ_dih=[], shift_dih=False,
                  shift_dih_params={'hist_bins': 100},
                  default_std={'bond': 0.005, 'angle': 0.15, 'dih': 0.2},
-                 env='vacuum', device='cpu'):
+                 env='vacuum', device='cpu', transform_max_frames=None,
+                 transform_stride=1, transform_offset=0, energy_mode='regularized'):
         """
         Boltzmann distribution of Alanine dipeptide
         :param data_path: Path to the trajectory file used to initialize the
@@ -37,6 +39,7 @@ class AldpBoltzmann(nn.Module, TargetDistribution):
         :type transform: String
         """
         super(AldpBoltzmann, self).__init__()
+        self.energy_mode = validate_energy_mode(energy_mode)
 
         # Define molecule parameters
         ndim = 66
@@ -117,7 +120,9 @@ class AldpBoltzmann(nn.Module, TargetDistribution):
 
         if data_path[-2:] == 'h5':
             # Load data for transform
-            traj = mdtraj.load(data_path)
+            from tr_asbs.fab.trajectory import load_trajectory_frames
+            traj = load_trajectory_frames(data_path, transform_max_frames,
+                                          transform_stride, transform_offset)
             traj.center_coordinates()
 
             # superpose on the backbone
@@ -146,11 +151,12 @@ class AldpBoltzmann(nn.Module, TargetDistribution):
         if n_threads > 1:
             self.p = distributions.TransformedBoltzmannParallel(system,
                             temperature, energy_cut=energy_cut, energy_max=energy_max,
-                            transform=self.coordinate_transform, n_threads=n_threads)
+                            transform=self.coordinate_transform, n_threads=n_threads,
+                            energy_mode=self.energy_mode)
         else:
             self.p = distributions.TransformedBoltzmann(sim.context,
                             temperature, energy_cut=energy_cut, energy_max=energy_max,
-                            transform=self.coordinate_transform)
+                            transform=self.coordinate_transform, energy_mode=self.energy_mode)
 
     def log_prob(self, x: torch.tensor):
         return self.p.log_prob(x)

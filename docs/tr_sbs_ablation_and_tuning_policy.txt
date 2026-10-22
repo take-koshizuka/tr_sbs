@@ -1,0 +1,214 @@
+TR-SBS reference / noise / solver: 実装結果とablation・tuning方針
+更新日: 2026-10-07
+checkout: /Users/koshizuka/Documents/tr_asbs
+基準HEAD: e20573c173401bb3751744f64ffed0e413651afc
+
+1. 今回の範囲と確認結果
+
+ジョブ投入、remote接続、学習キャンペーン、monitor予約は行っていない。
+実行したのはCPUでのunit testsと、各ケース4サンプル・4区間・FC/BC各1更新のsmoke。
+以下の数値は接続確認であり、分布品質・収束・速度優位の証拠にはしない。
+
+主な変更:
+・NoiseScheduleをreference/solver/gridから分離し、積分分散Vとその逆関数を提供。
+・constant/linear/geometric、既存EDM、既存discrete PIS cosineを選択可能。
+・BrownianReferenceとscalar OU/VP、解析bridge/score、true reverse conditionalを追加。
+・全solverのsampling/log_prob/conditional KLを同じGaussianTransitionに接続。
+・Euler自身のg(endpoint)^2 dt、既存solverのDelta V、OUの方向別Qを使い分ける。
+・diffusion-time Euler、linear exponential、deterministic midpoint、uniform tau gridを追加。
+・FC log_varianceをbatched kernel密度比へ移行。不要な終端勾配計算を省略。
+・FC path_klを追加。初期状態のみbuffer化し、現在のpolicyで微分可能なpathを生成。
+・physical/variance/both time embedding、hint progressの独立設定、FC/BC weightingを追加。
+・buffer/checkpointのsampling metadata、旧policy snapshot、phase/epochを保存・検証。
+・ALDPのdata pathとframe選択を明示し、native 60次元とCartesian 66次元を整理。
+・ALDPの単一IC chart、Jacobian、周期角の評価距離、OpenMM呼び出しカウンタを追加。
+
+主パイプライン:
+  reports/tr_sbs_pipeline_smoke/report.json
+  Target: Gaussian / GMM / ring GMM / many-well / DW4 / LJ13 / ALDP IC
+  Case: legacy CE / diffusion logvar / diffusion path KL / OU path KL / VP logvar
+  確認段階: Hydra構築 -> dual -> buffer -> FC -> BC -> evaluation logging ->
+            forward/reverse density -> checkpoint + frozen snapshot再読込 -> 不一致拒否。
+  DW4/LJ13の参照datasetはこのcheckoutにない。energy/gradient pipelineは確認し、
+  参照との品質指標はreference_metrics_available=0として省略した。参照データは作っていない。
+  全Targetのquality_statusはnot_evaluated。
+
+追加機能の確認:
+  reports/tr_sbs_feature_smoke/report.json
+  GMM上でEuler、tau+cosine、EDM、midpoint、both embeddingの各パイプライン。
+  tests/test_reference_kernels.py: 積分/逆関数、分散/logdet/KL、COM subspace、
+  graph batch、OU bridge/score、VP stationarity、zero-rate limit、gamma=0、
+  0<gamma<1のGaussian gradient oracle、batched logvar、snapshot resume。
+  tests/test_internal_coordinate_chart.py: 有効域、往復、Jacobian、勾配の有限差分。
+
+2. 実装の意味と比較時の固定条件
+
+network出力u,hはscore単位。forward driftはf+g^2 uである。
+旧ExponentialIntegratorはendpoint drift*dt + integrated Brownian noiseのまま。
+diffusion-time Eulerはx+Delta V*u、OU solverはPhi*x+K*uで、意味が異なる。
+elapsed reverse timeのOU qはbase drift=-f、absolute hという定義。
+q_hとtrue Gaussian reverse conditionalを同一視しない。h=0はstationary reverseではない。
+
+新FC path_klの有限kernel objectiveは
+  gamma KL(P_new || P_h) + (1-gamma) KL(P_new || P_old)
+  P_h = nu(x_T) product_k q_h(x_k|x_{k+1})。
+nuの未知normalizerは加法定数であり、勾配を変えない。
+旧forward/backward networkのparametersを凍結し、状態に対する導関数は保持する。
+expected log p_newを-kernel entropyで置換し、旧forwardとのKLは解析的に計算する。
+これは有限kernelの損失である。旧CE targetの連続時間理論を一般化したという主張はしない。
+OUのCEはfixed gamma=1のみ。一般TRにはpath_klかkernel log_varianceを使う。
+detached score-hintモデルはpath_klに使用不可。log_varianceに接続できる。
+path_klでは出力clipの導関数もexactにする。旧straight-throughは既存modeで保持。
+cleanなloss比較では全候補のclip_gradient_modeをexactに揃え、clip有無は別ablationにする。
+
+gamma/dualの値とachieved forward KLは別に記録する。
+trust_region/achieved_forward_klは現在のforward path上のsum conditional KL推定値。
+同じsample上の標準誤差もログに出す。gamma選択だけでKL制約達成を宣言しない。
+bufferのscaled/clipped weightをraw ESSやnormalizerの推定に使わない。
+log_varianceのbufferは旧policyが変わるouter loopごとに必ず再生成する。
+
+checkpointはreference/grid/source/target/loss/model/data selectionの違いを拒否する。
+metadataのない旧checkpointはlegacy kernelに限りallow_legacy_checkpoint=trueで明示的に読む。
+再開時は凍結policyとphaseを保持し、bufferは再生成する。乱数列のbitwise再現は保証しない。
+sampling時の不要なnoise drawを除いたため、旧コードと同一seedのpathはbitwise一致しない。
+
+3. 順序を固定したablation
+
+全因子の直積gridは作らない。Targetごとにcampaign ID/config/output/seed bankを分離する。
+最初はGaussian、既存GMM(K=40,d=10)、many-wellの3代表Targetでscreenする。
+ring/DW4/LJ13は選ばれた2候補のtransfer確認に使い、各Targetを全部再tuningしない。
+smoke時のsource.scale=1やtiny networkを本実験の設定として流用しない。
+
+A0: 定義・data・基準の凍結
+  target/source/coordinates、potential regularization、calibration frames、model容量、
+  gamma schedule、BC、乱数/評価bank、費用境界を先に固定する。
+  同じ新kernelコードでlegacy設定を再実行し、比較の基準R0を作る。
+  旧保存結果との比較ではdensity修正/RNG/ALDP chart変更を明記する。
+  R0 CE -> kernel logvar -> path KLをBrownian・同じnoise/gridで比較し、loss変更を先に分離。
+
+A1: solverのみ（学習なしの凍結policy評価を先行）
+  reference/noise関数を同一にし、uniform physical timeでEuler/legacy/diffusion Eulerを比較。
+  N={50,100,200}、同じ標準Gaussian noise bank・同じ出力数で評価する。
+  次に良いsolverだけuniform_t対uniform_tauを比較する。schedule knot数は128に固定。
+  learned policyの差が混入しない凍結比較後に、上位2設定だけ再学習する。
+
+A2: zero-drift noise shape
+  solver/grid/loss/embedding/priorを固定し、constant/geometric/discrete cosineの3候補。
+  linear/EDMは補助候補として必要な場合だけ追加する。
+  V(1)を一致させ、shapeとnoise amplitudeを同時に変更しない。
+  VE基準のV(1)=sigma_max^2-sigma_min^2。g_min/g_maxはamplitudeでありVEのsigmaとは違う。
+  geometric/cosineのshape ratioは最初にg_min/g_max={0.05,0.1,0.2}だけscreen。
+  候補noiseの関数はNを変えても固定し、cosineのnoise_knotsも変更しない。
+
+A3: reference
+  Brownian対OU対VPは同じFC loss・model・BC・source・費用で比較する。
+  path KL対path KLをoracle基準にし、安いlogvar版も同じreference内で別に比較する。
+  同じintegrated g^2に揃えた比較を主比較とする。
+  Phi(0,1)、Q_forward、Q_backward、uncontrolled terminal covarianceも保存する。
+  integrated g^2一致だけではterminal covarianceは一致しない。
+  VPはsource scaleとstationary scaleを一致させ、beta integralをV/source.scale^2に正規化。
+  OU rate={0.25,0.5,1.0}を小さくscreen。rate=0は機械的なBrownian limit検証。
+  VP beta shapeはconstantとincreasingの2候補から開始し、全beta_min/max gridは作らない。
+
+A4: solver/conditioning/lossの残り
+  OUのみleft control対deterministic midpoint。reference covariance Qは一致させる。
+  physical対variance embeddingを先行、bothは追加parameter数を記録して後続にする。
+  BC weightingはlegacy/reference_variance/none。bridge_time_epsilonは固定して比較。
+  weightingを選んでからepsilon={0.001,0.01}の感度を確認する。
+  score hintのphysical/variance progressはembeddingとは別に変える。
+  midpointのweak二次精度やscore hintによるOU理論の成立は今回の実装から主張しない。
+
+4. 新設定のtuning予算
+
+Targetごとに既存baselineのV/source/architectureを出発点にする。
+ALDPの初期Vは0.249999（既存VEの0.5^2-0.001^2）、source scale=1、N=200。
+reference_variance={0.5,1,2}倍、epsilon_TR={0.1,0.3,1.0}、
+FC learning rate={3e-5,1e-4,3e-4}、BC learning rateは最初1e-4固定。
+noise/referenceを選ぶ前にsource scaleやmodel容量を自由tuningしない。
+BC learning rateとFC/BC更新比は、その後の2候補比較でのみ調整する。
+例: BC:FC更新予算比={1:1,1:2}。同じepoch数は同じ費用とは限らない。
+
+successive halving:
+  (i) 1 seed・全予定費用の5%、各段階最大6候補 -> 上位2候補。
+  (ii) 上位2候補・全予定費用の20%、追加2 seeds -> freeze。
+  (iii) freezeした2候補・合計3 seeds・100%費用 -> final比較。
+Stage間で既存baselineと既にscreen済みの共通候補は再利用し、重複runを作らない。
+Stageの列挙数に合わせるために弱い候補を補充しない。失敗/numerical_failureの行を残す。
+candidate選択とfinal testのbankを分離する。testを見てからparameterを変更しない。
+
+screen基準は有限lossだけでなくraw ESS、weight tail、mode coverage、reference error。
+ALDPでは物理energy分布、torsion marginals、periodic phi/psi joint距離を使う。
+初期successive-halvingで一時的に低いmode occupancyだけを見て候補を落とさず、
+独立seedで再現する崩壊・nonfinite・KL逸脱を優先的に除外する。
+質と費用のPareto候補を残し、mean energyだけが下がるcollapseを勝者にしない。
+
+5. ALDP ICへの接続と専用の比較条件
+
+experiment=ad_ic_referenceはGaussian state y in R^60を使用する。
+legacy standardized IC zも60次元、Cartesian xは66次元。
+  y -> smooth chart z -> existing FAB coordinate transform x
+  log nu_y = log nu_z(z(y)) + log|dz/dy|
+log nu_zにも既存のcoordinate Jacobianが含まれている。OpenMM energyとの混同を避ける。
+chartはbond>0、angle in (0,pi)、dihedralの単一fundamental intervalを保つ。
+calibration mean周辺のderivativeを1に合わせ、sourceのlocal scale変更を小さくした。
+kernel/bridge/BCはy上のEuclidean Gaussian。pathの途中でz/Cartesianをwrapしない。
+旧zの周期aliasは実際に同じCartesian/energyを返す。単純なpost-step wrapと
+Euclidean Gaussian densityの併用は比較対象として採用しない。
+source/FC/BC/controlは全てy単位。sample(coordinate='native')、
+native_to_cartesian/cartesian_to_nativeで同じAPIを使用する。
+legacy chartは互換用に残すが、単一chart版と同じtarget densityと呼ばない。
+
+データ:
+  val.h5: 1,000,000 frames、test.h5: 10,000,000 frames（実ファイルmetadataで確認）。
+  calibration: val offset=0,stride=100,max_frames=4096。
+  validation: val offset=500000,stride=100,max_frames=4096。
+  final test: test.h5をfreeze後に使用。例offset=0,stride=2000,max_frames=4096。
+  smokeだけはcalibration/reference各16 frames、offset=0/128,stride=1。
+  production比較の前に同じcalibrationでtransform/chart bufferを一度freezeし、
+  frame ID、file SHA、buffer state、temperature/env/regularizationを全候補で共有する。
+  これらのframe列は時間相関を持ち得る。block単位の分割・誤差評価を行い、
+  iid referenceや収束済みMDと自動的には呼ばない。
+
+ALDPの推奨順序:
+  (a) 単一chart + legacy solver/lossを基準として、data/measureを揃える。
+  (b) Brownian constant + diffusion Euler + logvarを安い第一候補にする。
+  (c) 同じreferenceのpath KLを少数予算で対照とし、FC近似と費用を評価する。
+  (d) 最良Brownianに対しOU/VPを同じlossで比較する。
+  (e) 上位2設定だけN、noise amplitude、epsilon_TR、LRを順にtuning。
+  (f) frozen final seeds/bankでtorsion modes、cut付近の訪問、物理energy/geometryを検証。
+chartのbranch cutをまたぐ探索はyのtailを通るため、torsion mixingを別に評価する。
+単一chartが探索を妨げる場合はcut変更/複数chartを後続課題とし、途中でtargetを変えない。
+
+費用:
+  cost/openmm_configurations、cost/openmm_batch_callsを記録する。
+  backendはenergyとforceを同時に計算するため、B個のconfiguration評価はB回分の費用。
+  train/dual/buffer/eval/setupを分け、end-to-end wall timeも同一device条件で比較する。
+  path KLはFCのたびにterminal energy/forceを評価する。logvarは固定path上の密度を再利用。
+  logvarの不要なterminal score/control計算は実装で除いた。
+  log_buffer_grad_norm=falseをpilotの標準とし、force診断は小さい固定bankで周期的に行う。
+  cheap screenはOpenMM configuration予算、finalは同じ費用と同じ品質の両方を報告する。
+  local smokeのsecondsをGPU speedupや学習性能の根拠に使わない。
+
+6. 使い方と後続の境界
+
+軽量検証のみ（このscriptは4サンプル/4区間/1 FC/1 BCを固定）:
+  cd /Users/koshizuka/Documents/tr_asbs
+  .venv/bin/python scripts/smoke_tr_sbs_pipeline.py --targets gauss gmm ring manywell dw4 lj13 alanine_ic
+  .venv/bin/python -m pytest -q tests
+
+以下は将来remoteで実行するための設定例。今回は実行/submitしていない:
+  .venv/bin/python -m tr_asbs.experiment.train_gamma_asbs_iw experiment=ad_ic_reference \
+    reference_preset=brownian_constant reference_solver=diffusion_euler \
+    reference_steps=200 reference_variance=0.249999 fc_loss_mode=log_variance \
+    bc_loss_weight=reference_variance log_buffer_grad_norm=false
+  OU例: reference_preset=ou reference_solver=linear_exponential reference_rate=0.5
+  midpoint: reference_control_evaluation=midpoint
+  gridのみ: reference_grid=uniform_tau
+  embedding: ++controller.time_coordinates=physical|variance|both （correctorも同様）
+
+remote実験が必要になった時点でz3/raidenをユーザーに確認し、既存submission機構を使う。
+今回の方針を根拠に自動submit/monitorを開始しない。
+GeneralASBS consistencyとgraph atomic trainerの新reference学習は未対応として拒否する。
+graph kernelのCOM密度自体はunit test済み。ALDP ICはflat GammaASBSModuleを使用する。
+nonlinear drift、full covariance、wrapped OU、continuous cosine noiseは今回の範囲外。
+独立variational DISのreverse OUを、今回のTR-SBS reference実装の証拠には使っていない。

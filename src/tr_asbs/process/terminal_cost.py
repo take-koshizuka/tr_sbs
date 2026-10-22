@@ -34,15 +34,19 @@ class BaseTerminalCost(nn.Module, ABC):
 class BaseGradEnergy:
     """Compute clipped gradient of energy E(X_1)."""
 
+    gradient_clip_accumulation_dtype = 'float64'
+
     def __init__(self, potential, grad_clip_val: float | None = None, **kwargs):
         self.potential = potential
         self.grad_clip_val = grad_clip_val
 
     def clip(self, grad_E: torch.Tensor) -> torch.Tensor:
         if self.grad_clip_val is not None:
-            norm = torch.linalg.vector_norm(grad_E, dim=-1).detach()
+            # Finite float32 OpenMM forces can overflow a float32 squared norm.
+            # Accumulate in double so clipping retains their direction.
+            norm = torch.linalg.vector_norm(grad_E.double(), dim=-1).detach()
             clip_coefficient = torch.clamp(self.grad_clip_val / (norm + 1e-6), max=1)
-            clip_coefficient = clip_coefficient.unsqueeze(-1)
+            clip_coefficient = clip_coefficient.to(grad_E.dtype).unsqueeze(-1)
         else:
             clip_coefficient = torch.ones_like(grad_E)
         return grad_E * clip_coefficient
@@ -61,7 +65,7 @@ class BaseGradEnergy:
             "grad": clip_grad,
         }
         if return_grad_norm:
-            grad_norm = torch.sqrt(grad.pow(2).sum(dim=-1, keepdim=True) + eps)
+            grad_norm = torch.sqrt(grad.double().pow(2).sum(dim=-1, keepdim=True) + eps)
             result["grad_norm"] = grad_norm.squeeze(-1)
         return result
 

@@ -123,14 +123,37 @@ class TimeEmbed(Model):
             embed_t = self.activation(layer(embed_t))
         return self.out_layer(embed_t)  # (N, dim_out)
 
-def clip(tensor: torch.Tensor, max_norm: float | None = None):
+class _StraightThroughClip(torch.autograd.Function):
+    generate_vmap_rule = True
+
+    @staticmethod
+    def forward(tensor, max_norm):
+        return tensor.clamp(min=-max_norm, max=max_norm)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        pass
+
+    @staticmethod
+    def backward(ctx, gradient):
+        return gradient, None
+
+    @staticmethod
+    def jvp(ctx, gradient, limit_gradient):
+        return gradient
+
+
+def clip(tensor: torch.Tensor, max_norm: float | None = None, gradient_mode="straight_through"):
     """Straight-through per-component clip -- see egnn.py's clip() for the
     identical fix and full rationale (a plain torch.clip zeros the gradient
     beyond its bounds, silently killing the training signal on the network's
     own output exactly when a large-magnitude control is needed)."""
     if max_norm is not None:
-        clipped = tensor.clip(min=-1.0 * max_norm, max=max_norm)
-        tensor = tensor + (clipped - tensor).detach()
+        if gradient_mode == "exact":
+            return tensor.clip(min=-1.0 * max_norm, max=max_norm)
+        # Subtracting and readding large values loses the clipped result in
+        # float32. Return the actual clamp while preserving its ST derivative.
+        tensor = _StraightThroughClip.apply(tensor, max_norm)
     return tensor
 
 
@@ -166,6 +189,8 @@ class FourierMLP(Model):
         last_bias_init: Callable | None = None,
         last_weight_init: Callable | None = None,
         clip_norm: float | None = None,
+        time_coordinates: str = "physical",
+        clip_gradient_mode: str = "straight_through",
         **kwargs,
     ):
         super().__init__(dim=dim, **kwargs)
@@ -189,6 +214,22 @@ class FourierMLP(Model):
         )
         
         self.clip_norm = clip_norm
+        if clip_gradient_mode not in ("straight_through", "exact"):
+            raise ValueError("Invalid clip_gradient_mode")
+        self.clip_gradient_mode = clip_gradient_mode
+        if time_coordinates not in ("physical", "variance", "both"):
+            raise ValueError("time_coordinates must be physical, variance, or both")
+        self.time_coordinates = time_coordinates
+        self._time_reference = None
+        if time_coordinates == "both":
+            self.variance_timestep_embed = TimeEmbed(
+                dim_out=self.channels, activation=self.activation,
+                num_layers=2, channels=self.channels)
+
+    def set_reference(self, reference):
+        # Preserve legacy state_dict shapes in physical-time mode.
+        if self.time_coordinates != "physical":
+            self._time_reference = reference
 
     def forward(self, t: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         # 期待: x は (..., dim), t は同じ先頭次元で (..., 1)
@@ -200,7 +241,16 @@ class FourierMLP(Model):
 
         # 2D に畳んで処理
         t2, x2 = self._flatten_pair(t, x)          # (N,1), (N,dim)
-        embed_t = self.timestep_embed(t2)          # (N, C)
+        if self.time_coordinates == "physical":
+            embed_t = self.timestep_embed(t2)
+        else:
+            if self._time_reference is None:
+                raise RuntimeError("Variance-time embedding requires set_reference()")
+            tau = self._time_reference.reparametrize_time(t2).to(t2)
+            if self.time_coordinates == "variance":
+                embed_t = self.timestep_embed(tau)
+            else:
+                embed_t = self.timestep_embed(t2)+self.variance_timestep_embed(tau)
         embed_x = self.input_embed(x2)             # (N, C)
         assert embed_t.shape == embed_x.shape
 
@@ -215,7 +265,7 @@ class FourierMLP(Model):
             out = out.view(*prefix, self.dim_out)
             
         if self.clip_norm is not None:
-            out = clip(out, max_norm=self.clip_norm)
+            out = clip(out, max_norm=self.clip_norm, gradient_mode=self.clip_gradient_mode)
         return out
 
 

@@ -28,7 +28,9 @@ from typing import Any
 from omegaconf import OmegaConf
 
 from tr_asbs.process.sde import ControlledSDE, ControlledFBSDE
+from tr_asbs.process.reference import LinearGaussianReference
 from tr_asbs.utils.training import EMA, copy_model
+from tr_asbs.utils.gradient_clip import clip_gradients_with_overflow_fallback
 from tr_asbs.data.buffer import BatchBuffer
 from tr_asbs.utils.eval_logweight import compute_raw_path_ess, compute_reverse_ess, normalize_log_weights
 from tr_asbs.utils.helper import Checkpointer, CheckpointConfig, JointMetricDivergenceStopper
@@ -54,6 +56,8 @@ class GammaASBSModule:
 
     def __init__(self, cfg: DictConfig):
         super().__init__()
+        from tr_asbs.experiment.reference_config import configure_reference
+        configure_reference(cfg)
         self.cfg = cfg
         # group_id determines checkpoint_directory (see below). A fresh random_hash
         # is appended on every process launch by default -- meaning `resume=true`
@@ -89,7 +93,23 @@ class GammaASBSModule:
         # style alternative, see adjoint_matching_log_variance_step). Gamma is still
         # computed via optimize_gamma() either way -- only the u-loss itself changes.
         self.fc_loss_mode = getattr(cfg, "fc_loss_mode", "cross_entropy")
-        assert self.fc_loss_mode in ["cross_entropy", "log_variance"]
+        assert self.fc_loss_mode in ["cross_entropy", "log_variance", "path_kl"]
+        self.fc_backward_mode = getattr(cfg, "fc_backward_mode", "native")
+        if self.fc_backward_mode not in ("native", "loss_scaled_fp64_clip"):
+            raise ValueError("Invalid fc_backward_mode")
+        if self.fc_backward_mode != "native" and self.fc_loss_mode != "log_variance":
+            raise ValueError("Scaled controller backward requires the LV loss")
+        self.fc_backward_statistics = dict(attempts=0, updates=0, loss_nonfinite=0,
+            gradient_nonfinite=0, minimum_scale=1., maximum_scale=0.)
+        self.bc_loss_weight = getattr(cfg, "bc_loss_weight", "legacy")
+        self.fc_loss_weight = getattr(cfg, "fc_loss_weight", "legacy")
+        if self.fc_loss_weight not in ("legacy", "diffusion_energy"):
+            raise ValueError("Invalid fc_loss_weight")
+        if self.bc_loss_weight not in ("legacy", "none", "reference_variance"):
+            raise ValueError("Invalid bc_loss_weight")
+        self.bridge_time_epsilon = float(getattr(cfg, "bridge_time_epsilon", 0.001))
+        if not 0 < self.bridge_time_epsilon < 0.5:
+            raise ValueError("bridge_time_epsilon must be in (0, .5)")
 
         # Variance-reduction trick from the reference ASBS repo (adjoint_matcher.
         # duplicates in facebookresearch/adjoint_samplers): each freshly simulated
@@ -230,12 +250,43 @@ class GammaASBSModule:
             # Process and integration
             self.source = hydra.utils.instantiate(cfg.source, device=self.fabric.device)
             self.base_sde = hydra.utils.instantiate(cfg.base_sde, is_mean_free=self.potential.is_mean_free)
+            for model in (self.controller, self.corrector):
+                for module in list(model.modules()):
+                    setter = getattr(module, "set_reference", None)
+                    if callable(setter):
+                        setter(self.base_sde)
             self.sde = ControlledFBSDE(
                 base_sde=self.base_sde,
                 u_controller=self.controller, 
                 h_controller=self.corrector
             )
             self.integrator = hydra.utils.instantiate(cfg.integrator, sde=self.sde)
+
+            if isinstance(self.base_sde, LinearGaussianReference):
+                if self.fc_loss_mode == "cross_entropy" and not (
+                    self.gamma_schedule == "fixed" and self.gamma == 1):
+                    raise ValueError("Linear-reference TR updates require path_kl or log_variance; CE supports fixed gamma=1 only")
+                if self.base_sde.kind == "vp":
+                    expected = float(self.base_sde.stationary_scale.square())
+                    covariance = self.source.cov
+                    if self.potential.is_mean_free:
+                        n, d = self.source.n_particles, self.source.spatial_dim
+                        projector = torch.eye(n, device=covariance.device)-torch.ones(n, n, device=covariance.device)/n
+                        expected_covariance = expected*torch.kron(projector, torch.eye(d, device=covariance.device))
+                    else:
+                        expected_covariance = expected*torch.eye(covariance.shape[0], device=covariance.device)
+                    if not torch.allclose(covariance, expected_covariance.to(covariance)):
+                        raise ValueError("VP reference and Gaussian source scales must match")
+            if self.fc_loss_mode == "path_kl":
+                if any(type(m).__name__ == "TRIWScoreConditionedControl"
+                       for model in (self.controller, self.corrector) for m in model.modules()):
+                    raise ValueError("path_kl needs state derivatives; detached score hints are supported by log_variance instead")
+                # Straight-through output clipping changes state Jacobians and
+                # invalidates the pathwise derivative. Use actual derivatives.
+                for model in (self.controller, self.corrector):
+                    for module in model.modules():
+                        if hasattr(module, "clip_gradient_mode"):
+                            module.clip_gradient_mode = "exact"
 
             # Potential and cost function
             self.terminal_cost = hydra.utils.instantiate(
@@ -280,6 +331,8 @@ class GammaASBSModule:
         if self.corrector_trust_region_bound is None:
             self.corrector_trust_region_bound = cfg.trust_region_bound
         self.gamma_h = 1.0
+        if isinstance(self.base_sde, LinearGaussianReference) and self.corrector_gamma_mode != "none":
+            raise ValueError("Corrector gamma's legacy MSE proxy is not an OU/VP kernel KL; use corrector_gamma_mode=none")
 
         # Opt-in (default off, preserving existing behavior): clear the
         # adjoint buffer at the start of every outer loop so it never mixes
@@ -288,14 +341,23 @@ class GammaASBSModule:
         self.clear_adjoint_buffer_per_outer_loop = getattr(
             cfg, "clear_adjoint_buffer_per_outer_loop", False
         )
+        if self.fc_loss_mode == "log_variance":
+            # Stored RN ratios and old-controller means must belong to the same
+            # policy snapshot; stale paths are not valid VarGrad training data.
+            self.clear_adjoint_buffer_per_outer_loop = True
 
         # Process the training curriculum
         self.max_outer_loops = cfg.max_outer_loops
         self.adjoint_matching_epochs = cfg.adjoint_matching_epochs
         self.corrector_matching_epochs = cfg.corrector_matching_epochs
+        initial_epochs = getattr(cfg, "initial_adjoint_matching_epochs", None)
+        if initial_epochs is not None and (int(initial_epochs) != initial_epochs or initial_epochs < 1):
+            raise ValueError("initial_adjoint_matching_epochs must be a positive integer")
+        self.initial_adjoint_matching_epochs = int(
+            self.adjoint_matching_epochs if initial_epochs is None else initial_epochs)
         self.total_epochs = self.max_outer_loops * (
             self.adjoint_matching_epochs + self.corrector_matching_epochs
-        )
+        ) + self.initial_adjoint_matching_epochs - self.adjoint_matching_epochs
         
         # Optimizers and schedulers
         self.controller_optimizer = hydra.utils.instantiate(
@@ -317,6 +379,7 @@ class GammaASBSModule:
         self.ones_tensor = self.fabric.to_device(torch.ones(self.cfg.train_batch_size))
         self.divergence_stopper = JointMetricDivergenceStopper(self.cfg.divergence_early_stop)
         self.early_stop_requested = False
+        self.outer_step, self.phase, self.phase_epoch = 0, "ready", 0
 
         self.model_capacity = {
             "forward_controller_parameters": sum(
@@ -351,6 +414,7 @@ class GammaASBSModule:
                 ),
                 make_payload=lambda: {
                     "fbsde": self.sde.state_dict(),
+                    "sampling_metadata": self.sampling_metadata(),
                 },
             )
         
@@ -361,7 +425,7 @@ class GammaASBSModule:
     @property
     def lm(self) -> float:
         """lagrangian multiplier expressed from gamma. Kept for compatibility."""
-        return (1 - self.gamma) / self.gamma
+        return (1 - self.gamma) / self.gamma if self.gamma else math.inf
 
     def _update_divergence_early_stop(self, metrics):
         eval_index = self.current_epoch // self.cfg.log_detail_interval_epoch
@@ -376,8 +440,10 @@ class GammaASBSModule:
     
     def inner_loop_u(self):
         current_task = "adjoint_matching"
-        self.prev_integrator = copy_model(self.prev_integrator, self.integrator)
-        if self.clear_adjoint_buffer_per_outer_loop:
+        resuming = getattr(self, "phase", "ready") == "u" and getattr(self, "phase_epoch", 0) > 0
+        if not resuming:
+            self.prev_integrator = copy_model(self.prev_integrator, self.integrator)
+        if self.clear_adjoint_buffer_per_outer_loop and not resuming:
             # Without this, the buffer's FIFO eviction alone leaves stale
             # entries from the previous outer loop's (u_{i-1}, h_{i-1})
             # snapshot mixed in with fresh (u_i, h_i) entries for the first
@@ -387,7 +453,12 @@ class GammaASBSModule:
             # valid. Clearing here guarantees every sample in the buffer was
             # generated from the SAME frozen snapshot for the whole phase.
             self.adjoint_buffer.clear()
-        for j in range(self.cfg.adjoint_matching_epochs):
+        start_epoch = self.phase_epoch if resuming else 0
+        self.phase = "u"
+        regular_epochs = getattr(self, "adjoint_matching_epochs", self.cfg.adjoint_matching_epochs)
+        phase_epochs = (getattr(self, "initial_adjoint_matching_epochs", regular_epochs)
+                        if getattr(self, "outer_step", 0) == 0 else regular_epochs)
+        for j in range(start_epoch, phase_epochs):
             self.populate_buffer_adjoint_matching()
             dataloader = self.create_dataloader(current_task)
             for batch in tqdm(
@@ -401,6 +472,7 @@ class GammaASBSModule:
                     self.global_step += 1
         
             self.current_epoch += 1
+            self.phase_epoch = j + 1
             if hasattr(self.potential, "update_epoch"):
                 self.potential.update_epoch(self.current_epoch)
 
@@ -425,7 +497,8 @@ class GammaASBSModule:
             
     def inner_loop_h(self):
         current_task = "corrector_matching"
-        if self.corrector_gamma_mode != "none":
+        resuming = getattr(self, "phase", "ready") == "h" and getattr(self, "phase_epoch", 0) > 0
+        if self.corrector_gamma_mode != "none" and not resuming:
             self.prev_corrector = copy_model(self.prev_corrector, self.corrector)
             if self.corrector_gamma_mode in ("reuse_u_gamma", "joint_reuse"):
                 self.gamma_h = self.gamma
@@ -434,7 +507,9 @@ class GammaASBSModule:
             elif self.corrector_gamma_mode == "joint_independent":
                 self.gamma_h = self.compute_corrector_gamma(reference=self.controller)
             self.fabric.log("train/corrector_gamma", self.gamma_h, step=self.global_step)
-        for j in range(self.cfg.corrector_matching_epochs):
+        start_epoch = self.phase_epoch if resuming else 0
+        self.phase = "h"
+        for j in range(start_epoch, self.cfg.corrector_matching_epochs):
             self.populate_buffer_corrector_matching()
             dataloader = self.create_dataloader(current_task)
             for batch in tqdm(
@@ -448,6 +523,7 @@ class GammaASBSModule:
                     self.global_step += 1
             
             self.current_epoch += 1
+            self.phase_epoch = j + 1
             if hasattr(self.potential, "update_epoch"):
                 self.potential.update_epoch(self.current_epoch)
 
@@ -498,15 +574,17 @@ class GammaASBSModule:
             )
         self._update_divergence_early_stop(metrics)
 
-        for outer_step in range(self.max_outer_loops):
-            if self.gamma_schedule == "trust_region":
+        for outer_step in range(getattr(self, "outer_step", 0), self.max_outer_loops):
+            self.outer_step = outer_step
+            phase = getattr(self, "phase", "ready")
+            if phase == "ready" and self.gamma_schedule == "trust_region":
                 self.gamma, self.V0 = self.optimize_gamma()
                 if self.trust_region_adaptive:
                     self.adapt_trust_region_bound()
                 self.fabric.log(
                     "train/trust_region_bound", self.trust_region_bound, step=self.global_step
                 )
-            elif self.gamma_schedule == "fixed":
+            elif phase == "ready" and self.gamma_schedule == "fixed":
                 # V0 must still be refreshed every outer loop even though gamma
                 # itself doesn't change -- see compute_V0_for_fixed_gamma for why
                 # (leaving it at the __init__ default of 1e-9 makes the buffer's
@@ -515,12 +593,16 @@ class GammaASBSModule:
                 # the CE loss's own importance weights to a trivial iw=1 for every
                 # sample, silently turning "importance weighting" into a no-op).
                 self.V0 = self.compute_V0_for_fixed_gamma()
-            self.inner_loop_u()
-            if self.early_stop_requested:
-                break
+            if phase in ("ready", "u"):
+                self.inner_loop_u()
+                if self.early_stop_requested:
+                    break
+                self.phase, self.phase_epoch = "h", 0
             self.inner_loop_h()
             if self.early_stop_requested:
                 break
+            self.outer_step, self.phase, self.phase_epoch = outer_step + 1, "ready", 0
+            self.save_checkpoint(periodic=True)
 
         self.save_checkpoint()
         self.log_final()
@@ -533,7 +615,9 @@ class GammaASBSModule:
         """Populate the buffer with data from the controlled SDE integration and log the
         buffer size if the next task is adjoint matching."""
         buffer = self.adjoint_buffer
-        is_init_stage = self.current_epoch < self.cfg.adjoint_matching_epochs
+        buffer.bind_metadata(self.sampling_metadata())
+        is_init_stage = self.current_epoch < getattr(
+            self, "initial_adjoint_matching_epochs", self.cfg.adjoint_matching_epochs)
         # Determine the number of samples to populate the buffer
         # NOTE: Currently we don't save buffer to checkpoint, so restarting the training
         # will repopulate the buffer from scratch with initial_buffer_samples
@@ -552,6 +636,14 @@ class GammaASBSModule:
                 f"inference batch size ({self.cfg.inference_batch_size}). "
                 "Adjusting to the nearest lower multiple."
             )
+
+        if self.fc_loss_mode == "path_kl":
+            # Only x0 is needed by a current-policy pathwise loss. Avoid frozen
+            # rollouts and terminal energy/force calls merely to fill this buffer.
+            for _ in range(num_extend_cycles):
+                buffer.extend(data_0=self.source.sample((self.cfg.inference_batch_size,)))
+            self.fabric.log("train/adjoint_matching_buffer_size", len(buffer), step=self.global_step)
+            return
 
         # Put the models into evaluation mode
         self.prev_integrator.eval()
@@ -607,29 +699,37 @@ class GammaASBSModule:
             if "log_Pref_Pu_det" in integral_results:
                 populate_data["log_Pref_Pu_det"] = integral_results["log_Pref_Pu_det"].unsqueeze(-1).detach()
             
-            terminal_cost_results = self.terminal_cost(
-                data_1=integral_results['data_1'],
-                is_init_stage=is_init_stage,
-                return_energy=self.cfg.log_buffer_energy,
-                return_grad_norm=self.cfg.log_buffer_grad_norm,
-            )
+            if self.fc_loss_mode == "cross_entropy":
+                terminal_cost_results = self.terminal_cost(
+                    data_1=integral_results['data_1'],
+                    is_init_stage=is_init_stage,
+                    return_energy=self.cfg.log_buffer_energy,
+                    return_grad_norm=self.cfg.log_buffer_grad_norm,
+                )
             
-            populate_data["terminal_cost"] = terminal_cost_results["terminal_cost"].detach().cpu()
-            time_1 = self.fabric.to_device(torch.ones(self.cfg.inference_batch_size, dtype=torch.float))
-            populate_data["control_1"] = self.prev_integrator.sde.u_controller(time_1, integral_results['data_1']).detach().cpu()
-            if self.per_time_anchor_target:
-                # Frozen policy's own output at X_0 (time=0), needed so
-                # adjoint_matching_step can anchor the tau=0 target term to
-                # u_i(X_0, 0) instead of u_i(X_T, T) -- see per_time_anchor_target's
-                # docstring in __init__. X_0 doesn't change once sampled, so this
-                # is computed once here rather than per training step.
-                time_0 = self.fabric.to_device(torch.zeros(self.cfg.inference_batch_size, dtype=torch.float))
-                populate_data["control_0"] = self.prev_integrator.sde.u_controller(time_0, data_0).detach().cpu()
+                populate_data["terminal_cost"] = terminal_cost_results["terminal_cost"].detach().cpu()
+                time_1 = self.fabric.to_device(torch.ones(self.cfg.inference_batch_size, dtype=torch.float))
+                populate_data["control_1"] = self.prev_integrator.sde.u_controller(time_1, integral_results['data_1']).detach().cpu()
+                if self.per_time_anchor_target:
+                    # Frozen policy's own output at X_0 (time=0), needed so
+                    # adjoint_matching_step can anchor the tau=0 target term to
+                    # u_i(X_0, 0) instead of u_i(X_T, T) -- see per_time_anchor_target's
+                    # docstring in __init__. X_0 doesn't change once sampled, so this
+                    # is computed once here rather than per training step.
+                    time_0 = self.fabric.to_device(torch.zeros(self.cfg.inference_batch_size, dtype=torch.float))
+                    populate_data["control_0"] = self.prev_integrator.sde.u_controller(time_0, data_0).detach().cpu()
 
-            if self.cfg.log_buffer_energy:
-                populate_data["energy"] = terminal_cost_results["energy"].detach().cpu()
-            if self.cfg.log_buffer_grad_norm:
-                populate_data["grad_norm"] = terminal_cost_results["grad_norm"].detach().cpu()
+                if self.cfg.log_buffer_energy:
+                    populate_data["energy"] = terminal_cost_results["energy"].detach().cpu()
+                if self.cfg.log_buffer_grad_norm:
+                    populate_data["grad_norm"] = terminal_cost_results["grad_norm"].detach().cpu()
+
+            else:
+                if self.cfg.log_buffer_energy:
+                    populate_data["energy"] = -integral_results["target_log_prob"].detach().cpu()
+                if self.cfg.log_buffer_grad_norm:
+                    gradient = self.potential.grad_E(integral_results["data_1"])
+                    populate_data["grad_norm"] = gradient.reshape(gradient.shape[0], -1).norm(dim=-1).detach().cpu()
 
             if self.adjoint_buffer_duplicates > 1:
                 populate_data = {
@@ -688,6 +788,7 @@ class GammaASBSModule:
     @torch.no_grad()
     def populate_buffer_corrector_matching(self):
         buffer = self.corrector_buffer
+        buffer.bind_metadata(self.sampling_metadata())
         # is_init_stage = self.current_epoch < self.cfg.corrector_matching_epochs
         # Determine the number of samples to populate the buffer
         # NOTE: Currently we don't save buffer to checkpoint, so restarting the training
@@ -821,7 +922,9 @@ class GammaASBSModule:
     def training_step(self, batch, current_task) -> None:
         # Get the appropriate step function based on the current task
         if current_task == "adjoint_matching":
-            if self.fc_loss_mode == "log_variance":
+            if self.fc_loss_mode == "path_kl":
+                losses = self.forward_path_kl_step(batch)
+            elif self.fc_loss_mode == "log_variance":
                 losses = self.adjoint_matching_log_variance_step(batch)
             else:
                 losses = self.adjoint_matching_step(batch)
@@ -836,19 +939,47 @@ class GammaASBSModule:
         # Perform the optimizer step
         optimizer.zero_grad()
         loss = losses["loss"]
+        scaled_controller = (current_task == "adjoint_matching" and
+                             getattr(self, "fc_backward_mode", "native") == "loss_scaled_fp64_clip")
+        if scaled_controller:
+            if self.logvar_amp_dtype is not None or self.fabric.world_size != 1:
+                raise RuntimeError("Scaled LV backward requires one process without autocast")
+            if any(p.dtype != torch.float32 for p in model.parameters()):
+                raise RuntimeError("Scaled LV backward requires FP32 parameters")
+            self.fc_backward_statistics["attempts"] += 1
         
         if not torch.isfinite(loss):
+            if scaled_controller:
+                self.fc_backward_statistics["loss_nonfinite"] += 1
             return False
         
-        self.fabric.backward(loss)
+        if not scaled_controller:
+            self.fabric.backward(loss)
         try:
-            self.fabric.clip_gradients(model, optimizer, max_norm=self.cfg.gradient_clip_val)
+            if scaled_controller:
+                from tr_asbs.utils.scaled_backward_diagnostic import power_of_two_scale, unscale_and_clip
+                # A positive binary factor changes only backward arithmetic.
+                # Unscale in FP64 before the original norm bound and Adam step.
+                scale = power_of_two_scale(loss)
+                self.fabric.backward(loss * scale)
+                unscale_and_clip(model.parameters(), scale, self.cfg.gradient_clip_val)
+                stats = self.fc_backward_statistics
+                stats["minimum_scale"] = min(stats["minimum_scale"], scale)
+                stats["maximum_scale"] = max(stats["maximum_scale"], scale)
+            else:
+                clip_gradients_with_overflow_fallback(
+                    self.fabric, model, optimizer, self.cfg.gradient_clip_val)
         except RuntimeError as e:
             if "non-finite" in str(e):
+                if scaled_controller:
+                    self.fc_backward_statistics["gradient_nonfinite"] += 1
                 optimizer.zero_grad(set_to_none=True)
                 return False
             raise
         optimizer.step()
+        if scaled_controller:
+            self.fc_backward_statistics["updates"] += 1
+        self.last_training_losses = {name: float(value.detach().cpu()) for name, value in losses.items()}
         
         del loss
         torch.cuda.empty_cache()
@@ -900,7 +1031,7 @@ class GammaASBSModule:
         # t ~ U(1e-3, 1-1e-3)
         time = self.fabric.to_device(
             torch.rand(batch_size, dtype=torch.float)
-        ) * (1 - 2e-3) + 1e-3
+        ) * (1 - 2*self.bridge_time_epsilon) + self.bridge_time_epsilon
 
         data_t = self.base_sde.sample_posterior(time=time, data_0=data_0, data_1=data_1)
 
@@ -922,6 +1053,13 @@ class GammaASBSModule:
             target = self.gamma * (terminal_cost + control_1) - control_1
             target_0 = target_1 = target_t = target
 
+        if isinstance(self.base_sde, LinearGaussianReference):
+            # This branch is admitted only at fixed gamma=1. For general TR,
+            # frozen-policy Jacobians/running costs require path_kl/log_variance.
+            from tr_asbs.process.reference import coefficient
+            target_0 = coefficient(self.base_sde.adjoint_transport(time_0), data_0)*target_0
+            target_t = coefficient(self.base_sde.adjoint_transport(time), data_t)*target_t
+
         # 3つを dim0 でまとめる
         time_all = torch.cat([time_0, time_1, time], dim=0)          # (3B,)
         data_all = torch.cat([data_0, data_1, data_t], dim=0)        # (3B, ...)
@@ -940,6 +1078,8 @@ class GammaASBSModule:
             .mean(-1)                                                # (3B,)
             .mul(iw_all)                                             # (3B,)
         )                                                            # ここまではサンプル毎
+        if self.fc_loss_weight == "diffusion_energy":
+            per_sample = per_sample*self.base_sde.diffusion(time_all).square().reshape(-1)
 
         per_sample = per_sample.view(3, batch_size)
         loss_0 = per_sample[0].mean()
@@ -954,80 +1094,56 @@ class GammaASBSModule:
             loss_1=loss_1.detach().cpu(),
         )
 
-    def adjoint_matching_log_variance_step(self, batch) -> torch.Tensor:
-        """Log-variance (VarGrad-style) FC loss: an importance-weight-free
-        alternative to adjoint_matching_step's cross-entropy loss.
+    def forward_path_kl_step(self, batch):
+        """Finite-kernel TR objective on reparameterized current-policy paths.
 
-        Minimizes Var_{X~P^{u_i}}[ log(dP^u/dP^{u_i})(X) - gamma * log(dP^{v_i}/dP^{u_i})(X) ],
-        which is zero (up to an additive constant that variance doesn't see) exactly
-        when u induces the trust-region-tempered target P^{u_{i+1}} \\propto
-        (P^{v_i})^gamma (P^{u_i})^{1-gamma} (see the "geometric interpretation of the
-        trust region update" proposition). No importance weighting is needed --
-        we estimate a VARIANCE, not an expectation, so trajectories generated by the
-        fixed behavior policy u_i (not by the network being trained) are valid as-is,
-        unlike adjoint_matching_step's cross-entropy loss which needs iw = (dP^v_i/dP^u_i)^gamma.
-
-        Computes the full-path Girsanov log-ratio log(dP^u/dP^{u_i}) as the EXACT sum
-        of the discrete-time Gaussian transition-density log-ratio over every step of
-        the stored dense trajectory (data_traj, from populate_buffer_adjoint_matching),
-        matching the same discretization run_with_logweights itself uses for the
-        (exact) log_Ph_Pref term -- not a coarse subsampled approximation. All T steps
-        for the whole batch are evaluated in a single forward pass per network (new u
-        and frozen u_i) by flattening the (batch, T, ...) trajectory to ((batch*T), ...).
+        gamma*KL(P_new|P_h)+(1-gamma)*KL(P_new|P_old).
+        P_h = nu(x_T) product q_h(x_k|x_{k+1}). nu may be unnormalized;
+        its normalizer is an additive constant. Expected log p_new is replaced
+        by negative kernel entropy. P_old and q_h parameters stay frozen, but
+        their state derivatives are retained. This is a discrete objective.
         """
-        data_traj = batch["data_traj"]  # (B, T+1, ...)
-        # Raw (undamped) ratio: the "r" rescaling in populate_buffer_adjoint_matching
-        # exists only to avoid exp() overflow in adjoint_matching_step's importance
-        # weight, which doesn't apply here since this loss never exponentiates.
-        log_Ph_Pref = self.fabric.to_device(batch["log_Ph_Pref_raw"]).squeeze()
+        self.prev_integrator.requires_grad_(False)
+        x = self.fabric.to_device(batch["data_0"])
+        initial_log_prob = self.source.log_prob(x)
+        forward_reverse = torch.zeros_like(initial_log_prob)
+        old_kl = torch.zeros_like(initial_log_prob)
+        times = self.integrator.timesteps.to(x.device)
+        for t, tn in zip(times[:-1], times[1:]):
+            dt = tn-t
+            new = self.integrator.transition(x, t, dt)
+            old = self.prev_integrator.transition(x, t, dt)
+            old_kl = old_kl + new.kl(old)
+            xn = new.sample()
+            reverse = self.prev_integrator.transition(xn, tn, dt, backward=True)
+            forward_reverse = forward_reverse - new.entropy()-reverse.log_prob(x)
+            x = xn
+        target_cost = initial_log_prob-self.potential.log_prob(x)+forward_reverse
+        loss = (self.gamma*target_cost+(1-self.gamma)*old_kl).mean()
+        return dict(loss=loss, path_target_cost=target_cost.mean().detach().cpu(),
+                    achieved_forward_kl=old_kl.mean().detach().cpu())
 
-        batch_size = self.cfg.train_batch_size
-        data_traj = self.fabric.to_device(data_traj)
-        timesteps = self.prev_integrator.timesteps.to(data_traj.device)  # (T+1,)
-        num_steps = timesteps.shape[0] - 1
-
-        x_starts = data_traj[:, :-1]  # (B, T, ...)
-        x_ends = data_traj[:, 1:]     # (B, T, ...)
-        trailing_shape = x_starts.shape[2:]
-
-        t_starts_flat = timesteps[:-1].unsqueeze(0).expand(batch_size, num_steps).reshape(-1)  # (B*T,)
-        x_starts_flat = x_starts.reshape(batch_size * num_steps, *trailing_shape)
-
-        # New (being-trained) controller and frozen u_i (behavior policy), evaluated at
-        # every interval's start point -- one forward pass each for the whole trajectory.
-        with torch.autocast(
-            device_type=x_starts_flat.device.type,
-            dtype=self.logvar_amp_dtype,
-            enabled=self.logvar_amp_dtype is not None,
-        ):
-            u_new_flat = self.controller(t_starts_flat, x_starts_flat)
+    def adjoint_matching_log_variance_step(self, batch):
+        """VarGrad with exact densities of the configured discrete kernels."""
+        data_traj = self.fabric.to_device(batch["data_traj"])
+        log_Ph_Pref = self.fabric.to_device(batch["log_Ph_Pref_raw"]).reshape(-1)
+        times = self.prev_integrator.timesteps.to(data_traj.device)
+        batch_size, steps = data_traj.shape[:2]
+        steps -= 1
+        shape = data_traj.shape[2:]
+        x = data_traj[:, :-1].reshape(batch_size*steps, *shape)
+        xn = data_traj[:, 1:].reshape(batch_size*steps, *shape)
+        t = times[:-1].expand(batch_size, steps).reshape(-1)
+        dt = times.diff().expand(batch_size, steps).reshape(-1)
+        # One network call per complete trajectory batch. Kernel densities stay
+        # in state precision even when the controller is autocast.
+        with torch.autocast(device_type=x.device.type, dtype=self.logvar_amp_dtype,
+                            enabled=self.logvar_amp_dtype is not None):
+            new = self.integrator.transition(x, t, dt)
             with torch.no_grad():
-                u_i_flat = self.prev_integrator.sde.u_controller(t_starts_flat, x_starts_flat)
-        u_new_flat = u_new_flat.float()
-        u_i_flat = u_i_flat.float()
-
-        def flat(x):
-            return x.reshape(x.shape[0], -1)
-
-        sigma2_flat = self.base_sde.diffusion(t_starts_flat).pow(2)
-        sigma2_bcast = sigma2_flat.view(-1, *([1] * (u_new_flat.dim() - 1)))
-        drift_new = flat(sigma2_bcast * u_new_flat)
-        drift_ui = flat(sigma2_bcast * u_i_flat)
-
-        disp_flat = flat((x_ends - x_starts).reshape(batch_size * num_steps, *trailing_shape))
-
-        diffsq = self.base_sde.diffsquare_integral
-        var_per_step = (diffsq(timesteps[1:]) - diffsq(timesteps[:-1])).to(data_traj)  # (T,)
-        var_flat = var_per_step.unsqueeze(0).expand(batch_size, num_steps).reshape(-1).clamp(min=1e-12)
-        dt_per_step = timesteps[1:] - timesteps[:-1]  # (T,)
-        dt_flat = dt_per_step.unsqueeze(0).expand(batch_size, num_steps).reshape(-1)
-
-        term = dt_flat * (disp_flat * (drift_new - drift_ui)).sum(-1) / var_flat
-        term = term - 0.5 * dt_flat**2 * (drift_new.pow(2).sum(-1) - drift_ui.pow(2).sum(-1)) / var_flat
-
-        log_ratio_new_vs_ui = term.view(batch_size, num_steps).sum(dim=1)  # (B,)
-
-        log_weight = log_ratio_new_vs_ui - self.gamma * log_Ph_Pref
+                old = self.prev_integrator.transition(x, t, dt)
+        ratio = (new.log_prob(xn)-old.log_prob(xn)).reshape(batch_size, steps).sum(-1)
+        log_weight = ratio-self.gamma*log_Ph_Pref
         loss = log_weight.var(unbiased=True)
         return dict(loss=loss, log_weight_mean=log_weight.mean().detach().cpu())
 
@@ -1041,7 +1157,7 @@ class GammaASBSModule:
         batch_size = self.cfg.train_batch_size
 
         # t ~ U(1e-3, 1-1e-3)
-        time = self.fabric.to_device(torch.rand(batch_size) * (1 - 2e-3) + 1e-3)
+        time = self.fabric.to_device(torch.rand(batch_size) * (1 - 2*self.bridge_time_epsilon) + self.bridge_time_epsilon)
         data_t = self.base_sde.sample_posterior(time=time, data_0=data_0, data_1=data_1)
 
         # time_1 を (B,) に揃える（self.ones_tensor がスカラーでもOK）
@@ -1083,7 +1199,16 @@ class GammaASBSModule:
             target_t = score_t
             target_1 = score_1
 
-        coef_t = 1 + self.base_sde.diffusion(time).pow(2) * (1 - time) / time  # (B, ...?) 想定は (B,)
+        if self.bc_loss_weight == "none":
+            coef_t = torch.ones_like(time)
+        elif self.bc_loss_weight == "reference_variance":
+            if isinstance(self.base_sde, LinearGaussianReference):
+                _, _, variance = self.base_sde.transition_coefficients(0, time)
+            else:
+                variance = self.base_sde.diffsquare_integral(time)
+            coef_t = 1+self.base_sde.diffusion(time).square()*(1-time)/variance.to(time)
+        else:
+            coef_t = 1+self.base_sde.diffusion(time).square()*(1-time)/time
 
         loss_t = (
             (h_t - target_t)
@@ -1136,7 +1261,7 @@ class GammaASBSModule:
         data_1 = self.fabric.to_device(batch["data_1"])
         batch_size = data_0.shape[0]
 
-        time = self.fabric.to_device(torch.rand(batch_size) * (1 - 2e-3) + 1e-3)
+        time = self.fabric.to_device(torch.rand(batch_size) * (1 - 2*self.bridge_time_epsilon) + self.bridge_time_epsilon)
         data_t = self.base_sde.sample_posterior(time=time, data_0=data_0, data_1=data_1)
         time_1 = self.ones_tensor
         if time_1.ndim == 0:
@@ -1174,7 +1299,21 @@ class GammaASBSModule:
                 f"Pretrained controller checkpoint not found: {checkpoint_path}"
             )
         state = {"controller": self.controller, "corrector": self.corrector}
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        self.validate_sampling_checkpoint(payload)
         self.fabric.load(checkpoint_path, state)
+
+    def validate_sampling_checkpoint(self, payload):
+        metadata = payload.get("sampling_metadata")
+        if metadata == self.sampling_metadata():
+            return
+        legacy_kernel = (type(self.base_sde).__name__ in ("VESDE", "EDMSDE", "PISCosineSDE")
+                         and type(self.integrator).__name__ in ("ExponentialIntegrator", "AtomicExponentialIntegrator")
+                         and self.integrator.grid == "uniform_t"
+                         and all(getattr(m, "time_coordinates", "physical") == "physical"
+                                 for m in self.controller.modules()))
+        if metadata is not None or not (legacy_kernel and getattr(self.cfg, "allow_legacy_checkpoint", False)):
+            raise ValueError("Checkpoint sampling metadata differs; resume rejected")
 
     def load_checkpoint(self):
         """Load the resumable checkpoint (see save_checkpoint(periodic=True)) if
@@ -1194,9 +1333,28 @@ class GammaASBSModule:
         checkpoint_path = Path(self.checkpoint_directory) / "latest.pt"
         if not checkpoint_path.exists():
             return
+        # Validate before mutating models/optimizers. Old checkpoints are
+        # readable only with an explicit compatibility opt-in.
+        payload = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        self.validate_sampling_checkpoint(payload)
+        if "prev_integrator" in payload:
+            state.update(prev_integrator=self.prev_integrator, prev_corrector=self.prev_corrector)
         remainder = self.fabric.load(checkpoint_path, state)
         self.global_step = remainder.pop("global_step")
         self.current_epoch = remainder.pop("current_epoch")
+        self.gamma = remainder.pop("gamma", self.gamma)
+        self.V0 = remainder.pop("V0", self.V0)
+        self.gamma_h = remainder.pop("gamma_h", self.gamma_h)
+        self.outer_step = remainder.pop("outer_step", 0)
+        self.phase = remainder.pop("phase", "ready")
+        self.phase_epoch = remainder.pop("phase_epoch", 0)
+        if "prev_integrator" not in payload:
+            self.prev_integrator = copy_model(self.prev_integrator, self.integrator)
+            self.prev_corrector = copy_model(self.prev_corrector, self.corrector)
+        self.prev_integrator.requires_grad_(False)
+        self.prev_corrector.requires_grad_(False)
+        self.adjoint_buffer.clear()
+        self.corrector_buffer.clear()
 
     def save_checkpoint(self, only_controller: bool = False, periodic: bool = False):
         """Save the current state of the model and optimizer to a checkpoint.
@@ -1220,8 +1378,31 @@ class GammaASBSModule:
             "corrector_optimizer": self.corrector_optimizer,
             "global_step": self.global_step,
             "current_epoch": self.current_epoch,
+            "sampling_metadata": self.sampling_metadata(),
+            "gamma": self.gamma,
+            "V0": self.V0,
+            "gamma_h": self.gamma_h,
+            "prev_integrator": self.prev_integrator,
+            "prev_corrector": self.prev_corrector,
+            "outer_step": getattr(self, "outer_step", 0),
+            "phase": getattr(self, "phase", "ready"),
+            "phase_epoch": getattr(self, "phase_epoch", 0),
         }
         self.fabric.save(checkpoint_path, state)
+
+    def sampling_metadata(self):
+        return dict(kernel=self.integrator.kernel_metadata(), fc_loss_mode=self.fc_loss_mode,
+                    bc_loss_weight=getattr(self, "bc_loss_weight", "legacy"),
+                    fc_loss_weight=getattr(self, "fc_loss_weight", "legacy"),
+                    bridge_time_epsilon=getattr(self, "bridge_time_epsilon", 0.001),
+                    source=OmegaConf.to_container(self.cfg.source, resolve=True),
+                    controller=OmegaConf.to_container(self.cfg.controller, resolve=True),
+                    corrector=OmegaConf.to_container(self.cfg.corrector, resolve=True),
+                    target=OmegaConf.to_container(self.cfg.potential, resolve=True),
+                    terminal_cost=OmegaConf.to_container(self.cfg.terminal_cost, resolve=True),
+                    terminal_gradient_clip_accumulation_dtype=getattr(
+                        self.terminal_cost, "gradient_clip_accumulation_dtype", None),
+                    data_provenance=getattr(self.potential, "data_metadata", None))
     
     @torch.no_grad()
     @torch._dynamo.disable()  
@@ -1252,7 +1433,7 @@ class GammaASBSModule:
         
         if self.current_epoch > 0:
             # バッファが空でないか確認
-            if len(self.adjoint_buffer) > 0:
+            if len(self.adjoint_buffer) > 0 and self.adjoint_buffer.storage.get("log_Ph_Pref"):
                 # BatchBuffer.storage から直接参照 (CPU上のTensor)
                 # コピーは発生せず、参照だけなので爆速かつメモリ消費ゼロ
                 log_Ph_Pref = torch.stack(self.adjoint_buffer.storage["log_Ph_Pref"])
@@ -1273,9 +1454,11 @@ class GammaASBSModule:
                 if self.corrector_gamma_mode != "none":
                     results['gamma_h'] = self.gamma_h
             else:
-                # バッファが空の場合のハンドリング（必要なら）
-                pass
-        force_log_gt = getattr(self.potential, "name", "") == "ring_gmm"
+                # path_kl buffers contain x0 only; evaluate RN on fresh current
+                # paths without inventing a predicted update from replay weights.
+                results['log_RN[h|u]'] = results['log_Ph_Pref']
+                results['gamma'] = self.gamma
+        force_log_gt = getattr(self.cfg, "log_ground_truth_figures", False)
 
         if self.current_epoch == 0:
             logs = self.potential.log_details(results, visualize=visualize)
@@ -1293,6 +1476,11 @@ class GammaASBSModule:
                 )
                 logs["figures/data_0_hat"] = self.potential.visualize_raw(data_0_hat, title="data_0_hat")
         logs["eval/raw_path_ess"] = compute_raw_path_ess(results["log_Ph_Pref"])
+        kl_samples = integral_results['log_Pref_Pu_det'].detach().float()
+        logs["trust_region/achieved_forward_kl"] = kl_samples.mean().item()
+        logs["trust_region/achieved_forward_kl_se"] = (kl_samples.std(unbiased=False)/math.sqrt(kl_samples.numel())).item()
+        logs["trust_region/bound"] = self.trust_region_bound
+        logs["trust_region/gamma"] = self.gamma
         
         logs["epoch"] = self.current_epoch
         logs["eval_step"] = step
@@ -1779,6 +1967,8 @@ class GammaASBSModule:
         from scipy.special import logsumexp
 
         lm = self.lm  # (1 - gamma) / gamma, matching optimize_gamma's parametrization
+        if self.gamma == 0:
+            return float(np.mean(log_weights_np))  # Continuous gamma -> 0 limit.
         alpha = -1.0 / (1.0 + lm)
         term = logsumexp(alpha * log_weights_np, axis=1) - math.log(batch_size_path)
         V = (1.0 + lm) * (-np.mean(term))

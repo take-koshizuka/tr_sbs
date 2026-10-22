@@ -1,0 +1,43 @@
+{
+  "u_epochs": 2000,
+  "h_epochs": 1000,
+  "steps_per_epoch": 100,
+  "outer_loops": 1,
+  "online_interval_epochs": 250,
+  "quality_samples": 1024,
+  "phase_samples": 128,
+  "validation_samples": 256,
+  "milestones": {
+    "u": [
+      250,
+      500,
+      1000,
+      1500,
+      2000
+    ],
+    "h": [
+      125,
+      250,
+      500,
+      750,
+      1000
+    ]
+  },
+  "selection_bank": "a",
+  "disclosure_bank": "b",
+  "test_bank": "closed",
+  "prefix_is_screening_only": true,
+  "pair_requires_next_outer_confirmation": true,
+  "non_deterioration_limits": {
+    "heldout_loss_ratio": 1.05,
+    "torsion_js_absolute_increase": 0.01,
+    "physical_energy_w2_ratio": 1.1,
+    "coarse_basin_tvd_absolute_increase": 0.02,
+    "missing_mass_absolute_increase": 0.02,
+    "close_contact_fraction_absolute_increase": 0.02,
+    "near_cut_fraction_absolute_increase": 0.02,
+    "raw_log_path_ratio_variance_ratio": 1.1,
+    "raw_path_ess_fraction_ratio_min": 0.8
+  },
+  "claim": "finite-grid conditional adequacy, not convergence, global minimum or geometry admission"
+}

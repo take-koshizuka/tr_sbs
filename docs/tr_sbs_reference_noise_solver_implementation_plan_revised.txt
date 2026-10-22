@@ -1,0 +1,678 @@
+TR-SBS Reference Process / Noise Schedule / Solver 改善実装計画（現行コード照合版）
+更新日: 2026-10-07（Europe/London）
+
+対象 checkout:
+  /Users/koshizuka/Documents/tr_asbs
+  branch: codex/triw-cosine-noise
+  HEAD: e20573c173401bb3751744f64ffed0e413651afc
+
+原案:
+  /Users/koshizuka/Downloads/tr_sbs_reference_noise_solver_implementation_plan.txt
+  SHA256: b3852d2ce05b24a4c3716b1727e09e0be0edde226143cea511b245e3dc850835
+
+第1〜13節は実装前の比較・設計監査の記録。現在の実装状況は第14節を参照。
+コード変更と軽量pipeline検証を実施済み。学習キャンペーン・remote job 投入は未実施。
+原案の実験リストは将来の候補であり、今回の実行指示として扱わない。
+調査開始時は tracked 差分なし、untracked 項目33件、worktree は1個。
+未追跡の設定・テストは「現在のローカル状態」と「HEAD に保存済み」を区別する。
+
+============================================================
+1. 結論と原案からの主要変更
+============================================================
+
+現在の実装は geometric VE 固定ではない。VESDE、EDMSDE、PISCosineSDE、
+zero-drift reference bridge、conditional score、Integrator 基底が既にある。
+必要なのは、これらを捨てて新設することではなく、既存 API の互換移行と
+sampling / density / training loss が同じ離散 kernel を使う仕組みの整備である。
+
+実装順序を次へ変更する:
+  Stage 0: 旧動作・制御量・密度比の仕様を固定し、互換テストを作る。
+  Stage 1: kernel API と schedule API を接続し、zero-drift solver を拡張する。
+  Stage 2: scalar OU の解析 reference と、前向き・後向き kernel を検証する。
+  Stage 3: TR の FC target を監査・一般化し、OU の学習を解禁する。
+  Stage 4: deterministic predictor の midpoint と刻み感度を評価する。
+
+重要な修正:
+  ・現行 ExponentialIntegrator は「exact noise + Euler drift」である。
+  ・DiffusionTimeEuler は grid 変更に加え、drift の平均係数も変える。
+  ・現行 network output は score 単位。FC target に -g(t) a_t を直結しない。
+  ・OU の q は逆時間の定義次第で p と分散が異なる。共通分散を仮定しない。
+  ・FC log_variance、GeneralASBS の consistency loss、atomic 側にも移行点がある。
+  ・OU reference の正常動作と、OU TR-SBS の正しい学習を別の完了条件にする。
+
+============================================================
+2. 現行実装との対応表
+============================================================
+
+項目                         現行の状態                         必要な変更
+--------------------------------------------------------------------------
+Reference の分離              BaseSDE / FwdBwdSDE / ZeroDriftSDE  互換 adapter と解析 API の追加
+Noise schedule                VE / EDM / 離散 PIS cosine        共通 interval/inverse API を追加
+Reference bridge              sample_posterior が既存            既存式を保持し OU conditioning を追加
+Transition score              cond_score_t0 / cond_score_1t      名前・方向を整理し OU 式を追加
+Integrator                    BaseIntegrator と複数実装が既存   density を返す共通 kernel API に拡張
+現行 ExponentialIntegrator    drift=g(t)^2 u_theta dt           legacy として保存
+                              noise variance=V(t1)-V(t0)
+Diffusion-time solver         未実装                            drift=u_theta Delta V を追加
+Time grid                     uniform / quad / cosine の分岐    uniform_tau と validation を追加
+Time embedding                FourierMLP は raw t               embedding と score hint を別設定にする
+                              TRIW は N(1-t)、hint=t score
+Path density                  run_with_logweights が分散を直書き 各 kernel 自身の log_prob を使う
+FC CE                         endpoint/per-time anchor の2種    両方を保存し OU TR target を監査
+FC log_variance               Euler drift の比を手計算          微分可能な kernel 比へ移行
+BC weighting                  coef=1+g(t)^2(1-t)/t で除算       legacy weighting を API に移し新候補追加
+Trust-region dual             scipy optimize_gamma が既存       最適化式は保存、入力 kernel を更新
+Replay / checkpoints          endpoint、raw/scaled 比、dense path reference/grid/snapshot の識別を追加
+OU in variational DIS         独立した reverse-OU rollout が既存 TR-SBS の OU support とは数えない
+Atomic / mean-free            独立 override、射影 Gaussian      旧動作を保存、新 support は段階的に追加
+
+主な根拠（本書の path は repository root からの相対パス）:
+  src/tr_asbs/process/sde.py:72  ZeroDriftSDE
+  src/tr_asbs/process/sde.py:100 reparametrize_time
+  src/tr_asbs/process/sde.py:104 sample_posterior
+  src/tr_asbs/process/sde.py:147 cond_score_t0
+  src/tr_asbs/process/sde.py:202 VESDE
+  src/tr_asbs/process/sde.py:222 PISCosineSDE
+  src/tr_asbs/process/sde.py:286 EDMSDE
+  src/tr_asbs/process/sde.py:325 ControlledSDE
+  src/tr_asbs/process/sde.py:389 ControlledFBSDE.bwd_drift
+  src/tr_asbs/process/integrator.py:24 get_timesteps
+  src/tr_asbs/process/integrator.py:200 run_with_logweights
+  src/tr_asbs/process/integrator.py:335 ExponentialIntegrator
+  src/tr_asbs/process/integrator.py:390 AtomicIntegratorMixin.run_with_logweights
+  src/tr_asbs/experiment/train_gamma_asbs_iw.py:882 FC CE
+  src/tr_asbs/experiment/train_gamma_asbs_iw.py:957 FC log_variance
+  src/tr_asbs/experiment/train_gamma_asbs_iw.py:1034 BC
+  src/tr_asbs/experiment/train_gamma_asbs_iw.py:1724 optimize_gamma
+  src/tr_asbs/experiment/train_general_asbs_iw.py:955 consistency path quantities
+  src/tr_asbs/variational/control.py:279 TRIWScoreConditionedControl
+  src/tr_asbs/variational/schedules.py:21 cosine_diffusion_schedule
+
+============================================================
+3. 実装前に固定する数式・意味
+============================================================
+
+3.1 制御量と loss の単位
+
+現行の前向き SDE:
+  dX = [f + g^2 u_theta] dt + g dW
+  network_control = u_theta
+  girsanov_control = g u_theta
+  controlled_drift = g^2 u_theta
+
+現行 ASBSTerminalCost の c_T は grad E + h_theta(T,X_T)。
+初回は grad E のみ。gradient clipping の設定も既存仕様に含める。
+現行の default FC CE は:
+  a_T_legacy = gamma (c_T + u_i(T,X_T)) - u_i(T,X_T)
+  loss = IW * ||u_theta(t,X_t) + a_T_legacy||^2
+  評価時刻は 0、1、random t の3点。
+
+AM の -g(t) a_t は Girsanov control の target。
+現行 network output の target は -a_t となる。
+元論文の control 定義と adjoint 式は ASBS Appendix A.1, Eq.26–38 を参照:
+  https://arxiv.org/html/2506.22565v2#A1
+ここでの network 単位への換算は、論文式と現行 ControlledSDE からの導出。
+
+g^2 を MSE の重みに掛ける変更も、現行の unit weighting と区別する。
+単位換算と同時に loss weighting を変えると比較に別要因が入る。
+
+per_time_anchor_target=true は各時刻の u_i(t,X_t) を用いる。
+false の旧 default は gamma=0 でも全時刻を u_i(T,X_T) に回帰させる。
+この違いは互換テストに残す。旧 default の再現を gamma=0 の恒等更新と
+同一視せず、新しい TR target の正しさも別のゲートで検証する。
+
+3.2 Pref の意味と path ratio
+
+run_with_logweights の self は実際に経路を生成する proposal R。
+Pref というキー名でも、zero-control の base reference を意味しない。
+通常の buffer 生成では self=prev_integrator、比較相手も同じオブジェクト。
+
+  P_R = mu(x0) product_k p_R(x[k+1] | x[k])
+  P_u = mu(x0) product_k p_u(x[k+1] | x[k])
+  P_h = nu(xT) product_k q_h(x[k] | x[k+1])
+
+  log_Ph_Pref = log nu(xT) - log mu(x0)
+                 + sum log q_h - sum log p_R
+  log_Pu_Pref = sum log p_u - sum log p_R
+
+このキー・符号・dual 入力の -log_Ph_Pref は保存する。
+nu が未正規化なら第一の比も定数分だけ未正規化となるため、mean をそのまま
+絶対 KL と解釈しない。raw、gamma tempering、buffer rescale r、IW clipping を区別する。
+
+3.3 正方向・逆方向
+
+旧 backward step の dt は正の経過時間で、X_prev = X_current + bwd_drift * dt。
+zero drift では bwd_drift = g^2 h_theta である。
+
+最初の OU controlled solver は現行 h の absolute score 表現を保持する:
+  elapsed reverse drift = -f(t,x) + g(t)^2 h_theta(t,x)
+これは ASBS の backward half bridge の式からの拡張（Eq.17）:
+  https://arxiv.org/html/2506.22565v2#S4
+
+真の reference reverse kernel p_ref(X_s | X_t) は reference の marginal にも依存する。
+forward transition を単に逆引きした密度でも、上記 h=0 の proposal でもない。
+reference-residual 表現を後で加えるなら、score_ref の加減算、BC target、terminal cost、
+reverse base drift を一緒に変更し、absolute score 表現と混在させない。
+
+============================================================
+4. Stage 0: 互換仕様と監査を先行
+============================================================
+
+目的: 抽象化の変更と、数学・solver の変更を別々にレビュー可能にする。
+
+作業:
+  1. legacy VE / EDM / PIS cosine の schedule 値・時刻方向・dtype を保存する。
+  2. legacy forward/backward mean、variance、path ratio、CE/BC loss を fixture 化する。
+  3. gamma、V0、r、IW、per-time anchor、corrector damping の既存動作を記述する。
+  4. 同一 fixed noise を新旧 kernel に渡せるようにし、数値再現を検証する。
+  5. reference / solver / grid / time embedding / snapshot の識別子を定義する。
+  6. scalar/batched t、state dtype/device、N+1 node、端点、単調 grid を検証する。
+
+注意:
+  ・現在の mean 評価は step() を呼ぶため、捨てる乱数も生成する。
+    pure kernel API への移行で乱数消費が変わりうる。fixed noise での再現と、
+    RNG 呼び出し順を含む seed 再現を区別し、legacy adapter の仕様に残す。
+  ・EulerMaruyamaIntegrator は flat 版 step_backward が未実装で abstract のまま。
+    plain Euler を比較候補にする前に reverse step とその density を完成させる。
+  ・AtomicEuler は sampling variance=g(t)^2 dt、共通 IW は Delta V を用いている。
+    既存 Exponential の再現と、Euler の密度整合性修正を別の変更として扱う。
+  ・atomic override、mean-free density、GeneralASBS の別 loss は共通化から漏らさない。
+
+完了条件:
+  legacy 設定の sample、loss、raw ratio、固定 log-weight 入力の dual 出力が一致。
+  旧 checkpoint の読み込みが可能で、新規 metadata の default が legacy と明示される。
+
+============================================================
+5. Stage 1: 共通 kernel と zero-drift schedule / solver
+============================================================
+
+5.1 既存構造を拡張する API
+
+NoiseSchedule（nn.Module、T=1 を初期仕様とする）:
+  diffusion(t)
+  cumulative_variance(t)                 = V(t)
+  integrated_variance(t0,t1)             = V(t1)-V(t0)
+  inverse_cumulative_variance(tau)
+
+ZeroDriftReference:
+  drift(t,x)=0
+  reference_transition_parameters(x,s,t)
+  reference_transition_log_prob(x_t,x_s,s,t)
+  bridge_mean_cov / bridge_sample
+  transition_score(x_t,x_0,t)
+  adjoint_transport(t,T)=I
+  bc_loss_weight(t,mode)
+
+既存 diffsquare_integral、sample_posterior、cond_score_t0、total_variance は
+互換 alias として残す。loss weighting は reference の物理法則とは別の設定。
+
+BaseIntegrator に追加する pure API:
+  transition_parameters(x,t0,t1,direction,controller_override=None)
+  transition_log_prob(x_next,x,t0,t1,direction,controller_override=None)
+  conditional_kl(other,x,t0,t1,direction)   （対応 kernel のみ）
+
+step / step_backward は同じ parameters から sample する。
+log_prob / mean の計算では乱数を生成しない。
+sampling の no_grad と、loss 用 kernel 評価を分離し、controller の gradient を保持する。
+
+run_with_logweights は p_R、p_u、q_h をそれぞれの integrator から取得する。
+分散と log determinant を一つの base_sde から3 kernel に流用しない。
+現行 log_Pref_Pu_det の mean-distance 式は、対応する Gaussian conditional KL にする。
+
+5.2 旧 solver と新 solver を分ける
+
+LegacyExactNoiseEuler（ExponentialIntegrator の public path を保持）:
+  forward mean = x + g(t0)^2 u_theta(x,t0) Delta t
+  reverse mean = x + g_bwd(interval)^2 h_theta(x,t1) Delta t
+  both variances = Delta V
+
+continuous VE / EDM の reverse coefficient は従来どおり右端を使う。
+PIS cosine は現行 backward_step_diffusion の区間係数を使う。
+
+DiffusionTimeEuler:
+  forward mean = x + u_theta(x,t0) Delta V
+  reverse mean = x + h_theta(x,t1) Delta V
+  both variances = Delta V
+
+この更新は network_control を interval 内で freeze する離散モデル。
+uniform_t / uniform_tau は solver とは独立の grid 設定にする。
+uniform_tau は tau_k = k V(1)/N、t_k=V^{-1}(tau_k)。
+
+任意 grid の区間が PIS cosine の knot を跨ぐ場合も Delta V を全区間で積分する。
+legacy の point diffusion drift と Delta V drift が同じとは仮定しない。
+
+5.3 Schedule の実装順
+
+既存 Geometric VE -> EDM -> DiscretePISCosine を先に adapter 化する。
+その後 Constant、Linear を追加し、必要になった時点で ContinuousCosine を追加する。
+DiscretePISCosine は既存 cosine_diffusion_schedule を再利用する。
+reverse coefficient order、0.5 factor、piecewise V(t)、state_dict を保持する。
+既存 CosineNoiseSchedule alias を別の continuous cosine の意味に置き換えない。
+
+VE の現行式（r=sigma_max/sigma_min、r>1）:
+  g(t)=sigma_min r^(1-t) sqrt(2 log r)
+  V(t)=sigma_max^2 [1-r^(-2t)]
+  V(1)=sigma_max^2-sigma_min^2
+geometric という名称から増加方向の schedule を実装しない。
+
+PIS cosine の noise knot 数と solver step 数を別パラメータとして扱う。
+旧互換設定では双方128。刻み感度では noise 関数の knot を固定して solver のみ変更する。
+V の逆関数は analytic、piecewise inverse、または決定的 monotone inversion を使う。
+検証範囲では g>0、finite、V 単調、端点が有限。積分・逆関数は double で計算する。
+
+5.4 Time conditioning / bridge / weighting
+
+embedding_time: raw_t | normalized_diffusion_time | both（default raw_t）
+score_hint_progress: raw_t | normalized_diffusion_time（default raw_t）
+time_sampling: uniform_t | uniform_tau（default uniform_t）
+
+TRIW の raw step=N(1-t) と hint=t target.score は別々に変更可能にする。
+both は input 構造・parameter 数・checkpoint 互換性を変えるため別 ablation にする。
+solver の grid を変えたことだけで FC/BC の random time sampling を変えない。
+uniform_tau で旧 dt の loss integral を保つ場合、dt/dtau=1/g(t)^2、または
+dt/dtau_norm=V(1)/g(t)^2 に対応する重みと端点除外区間の変換を明示する。
+
+bridge は既存の mean=(1-V(t)/V(1))x0+[V(t)/V(1)]xT、
+variance=V(t)[1-V(t)/V(1)] を再利用する。
+旧 eps jitter を維持する互換経路と、端点を厳密に返す新 API を区別する。
+BC の legacy weight は 1/[1+g(t)^2(1-t)/t]、terminal 項の weight は1。
+none / variance normalization の追加は独立設定とし、default を変えない。
+
+完了条件:
+  VE / EDM / discrete cosine の旧互換が通る。
+  新 schedule と uniform_tau が config で選べる。
+  forward/reverse sampling と同じ kernel が IW、FC log_variance、評価で使われる。
+  新 solver に未対応の loss / state representation は初期化時に明確に拒否する。
+
+============================================================
+6. Stage 2: scalar linear Gaussian / OU machinery
+============================================================
+
+最初の対応範囲は flat、非 mean-free、scalar isotropic、constant / linear beta。
+diagonal/full matrix、harmonic、一般 nonlinear drift は後続とする。
+
+reference:
+  dX=A(t)X dt+G(t)dW
+  Phi(t,s): state transition
+  Q(s,t)=integral_s^t Phi(t,r) G(r)G(r)^T Phi(t,r)^T dr
+
+reference bridge を Gaussian conditioning で計算する:
+  m_t=Phi(t,0)x0、m_T=Phi(T,0)x0
+  C=Q(0,t)Phi(T,t)^T
+  bridge mean = m_t + C solve(Q(0,T),xT-m_T)
+  bridge covariance = Q(0,t)-C solve(Q(0,T),C^T)
+  transition score = -solve(Q(0,t),x_t-Phi(t,0)x0)
+
+最初の VP reference:
+  A(t)=-beta(t)/2、G(t)=sqrt(beta(t))、source=N(0,I)
+  J(s,t)=integral_s^t beta(r)dr
+  phi=exp[-J(s,t)/2]、Q_forward=1-phi^2
+
+LinearExponentialEuler の前向き controlled kernel:
+  B(t)=G(t)G(t)^T（現行 network 単位に対応）
+  mean_p = Phi(t,s)x_s + K_p(s,t)u_theta(x_s,s)
+  K_p = integral_s^t Phi(t,r)B(r)dr
+  covariance_p = Q(s,t)
+VP では K_p=2(1-phi)、Q_p=1-phi^2。
+exact なのは linear 部分・noise と frozen-control 区間の解。
+state/time に依存する learned control を含む SDE 全体の exact solution ではない。
+
+後向き controlled kernel は elapsed reverse base=-A、control=h_theta を freeze する。
+unit VP、absolute score 表現では:
+  mean_q = phi^(-1)x_t + 2[phi^(-1)-1]h_theta(x_t,t)
+  Q_q = phi^(-2)-1
+この式は上記 reverse drift を interval 内で積分した導出である。
+Q_q と Q_p は一般に異なる。各 log_prob の Gaussian 定数も別々に計算する。
+真の stationary reference reverse kernel は mean=phi x_t、covariance=Q_p であり、
+この learned proposal q と区別する。h=0 を stationary reverse と呼ばない。
+
+stationary preservation は uncontrolled reference の forward と、解析的な真の reverse
+kernel で検証する。absolute h=-x を freeze した proposal は刻み依存なので、
+その有限刻みの stationary preservation を解析 reference の条件と混同しない。
+
+zero-drift limit は A -> 0、G を固定して検証する。
+  Phi -> I、Q -> integral G G^T、K -> integral B
+これが Stage 1 DiffusionTimeEuler の両方向を回復する。
+VP の beta -> 0 は drift と diffusion を同時に消すため、この検証の代用にはならない。
+OU の small-rate/short-interval 式には expm1 等を用い cancellation を避ける。
+
+prior 比較:
+  現行 gmm_mode の source.scale は30。N(0,I)へ変更した結果を reference-only 改善としない。
+  machinery 検証は unit prior で行い、比較は双方の prior を一致させる。
+  元の scale=s を保持する比較には G=s sqrt(beta)、stationary prior=N(0,s^2 I) を使える。
+  この場合 Q_p=s^2(1-phi^2)、K_p=2s^2(1-phi) 等も同時に変更する。
+  OU では integral G^2 だけでなく Phi、Q、terminal reference covariance を記録する。
+
+完了条件:
+  reference transition / bridge / score が解析値と一致する。
+  controlled p と q の正規化、sample moments、density の整合性が通る。
+  zero-drift limit が通り、path ratio が p/q の別 covariance でも正しく計算される。
+  この段階の OU は machinery_validated。FC 理論確認前の通常学習は guard する。
+
+============================================================
+7. Stage 3: TR FC target の監査・OU 学習
+============================================================
+
+7.1 gamma=1 の基準
+
+terminal adjoint = grad E + h_theta(T,X_T)
+linear reference の transport = Phi(T,t)^T
+  a_t = Phi(T,t)^T a_T
+  network target = -a_t
+  Girsanov control target = -g(t)a_t
+VP なら kappa(t)=exp[-0.5 integral_t^T beta(r)dr]。
+この基準は ASBS Appendix A.1, Eq.26–38 と network 単位の換算で確認する:
+  https://arxiv.org/html/2506.22565v2#A1
+
+7.2 0<gamma<1 の TR target は追加導出を完了条件にする
+
+原案の「current terminal quantity を transport する」だけでは一般 TR matching の
+正しさを保証できない。既存 u_i による path measure の混合項と、endpoint/per-time
+anchor の差を扱う必要がある。
+
+理論ノートに次を明示する:
+  ・初期分布制約を含む TR objective と conditional normalization。
+  ・P_h^gamma P_ui^(1-gamma) の path ratio と、その matching target の関係。
+  ・reference Jacobian だけで十分か、frozen policy / running-cost 項が必要か。
+  ・score 単位、符号、端点、loss weight、stopgrad の位置。
+  ・continuous matching と有限刻み p/q による objective の近似範囲。
+
+fc_target_mode を legacy_endpoint と general_reference_tr に分ける。
+legacy_endpoint は旧 zero-drift の全動作を保存する。
+general_reference_tr の導出後は gamma=0 の自身の policy 再現、gamma=1 の上式、
+0<gamma<1 の小さな Gaussian 問題の oracle 比較を行う。
+general_reference_tr と legacy_endpoint に差があればアルゴリズム変更として記録し、
+Brownian と OU の reference 比較には同じ FC semantics を用いる。
+旧 target に kappa を掛けただけの候補を「full general-drift TR-SBS」と認定しない。
+
+7.3 Loss と学習経路の移行
+
+FC log_variance:
+  sum_k [log p_new(x[k+1]|x[k])-log p_ui(x[k+1]|x[k])]
+    - gamma log_Ph_Pref_raw
+を微分可能な kernel API で計算する。
+現行 displacement / Euler drift の展開式は legacy kernel の高速経路にのみ残す。
+OU の base drift、K、Q、midpoint をこの式から落とさない。
+
+BC:
+  absolute score 表現では OU の transition_score をそのまま target に使う。
+  bc_loss_weight の候補は legacy / none / analytic variance normalization。
+  isotropic reference の transition noise に対する score variance は 1/Q(0,t)。
+  weighting はこの成分を基準にしても、endpoint conditioning や IW による
+  target 全体の variance が同じとは仮定しない。t 下限と重みの上限を記録する。
+
+corrector_gamma_mode:
+  default none は保存する。既存 compute_corrector_gamma の raw score MSE proxy は
+  schedule/time 積分を含む achieved path KL ではない。
+  OU で non-none を対応させる前に kernel に基づく KL 計算か proxy の定義を監査する。
+  未対応なら非 legacy reference との組合せを拒否する。
+
+GeneralASBS:
+  consistency の mean=x_next+h*dt は、現行の g^2 h 単位とも異なる。
+  既存 loss の再現と、正しい q_kernel への統一を別モードで扱う。
+  kernel API へ移行するか、新 reference/solver との組合せを初期化時に拒否する。
+  「GeneralASBS」という class 名を general base drift 対応の証拠にしない。
+
+Replay / checkpoint:
+  raw と rescaled ratio を保持し、dense path の grid と behavior snapshot を識別する。
+  reference / solver / grid / conditioning が変わる場合は旧 buffer を使用しない。
+  clear_adjoint_buffer_per_outer_loop の旧 default=false は別の仕様として保存する。
+  buffer を保持する比較では frozen policy の世代差の扱いを明記する。
+  resume は kernel schema と設定を照合し、不一致を silent resume しない。
+
+完了条件:
+  旧 zero-drift legacy loss の回復と、general_reference_tr の正しさが別々に通る。
+  OU の FC/BC の gradient、dual update、snapshot 更新、checkpoint resume が通る。
+  bounded end-to-end smoke の後に remote の matched learning 比較へ進む。
+  非linear f の JVP adjoint はこの Stage の必須範囲から外す。
+
+============================================================
+8. Stage 4: deterministic midpoint、後続拡張
+============================================================
+
+LinearExponentialMidpoint は deterministic half-step predictor で u_mid を決め、
+full-step の mean を Phi x + K u_mid、noise covariance を Q とする。
+predictor に stochastic noise を入れず、given x の Gaussian kernel を維持する。
+reverse predictor も reverse base と q の係数を使い、forward のものを流用しない。
+log_variance loss は predictor 内の network evaluation も含めて微分する。
+
+Gaussian の log_prob が明示できることと、SDE の weak/strong 2次精度は別問題。
+「2次精度」とは呼ばず、線形 controlled 問題と刻み感度から精度を検証する。
+runtime は predictor 分の controller/score/energy evaluation を含めて比較する。
+RK4、stochastic Heun、generic stochastic RK は今回の優先範囲外とする。
+
+その後の任意拡張:
+  diagonal/full covariance、preconditioned OU、harmonic OU、nonlinear adjoint。
+mean-free / atomic では射影後の有効部分空間上の Gaussian density が必要。
+full-dimensional logdet をそのまま流用せず、singular covariance の support、
+effective dimension、prior、score の整合性を確認してから対応する。
+対応までは既存 atomic legacy を維持し、新 OU 設定を明確に拒否する。
+
+============================================================
+9. ファイル別の実装予定
+============================================================
+
+新規（名前は提案）:
+  src/tr_asbs/process/noise_schedules.py
+    continuous / piecewise schedule と inverse V、既存 cosine generator の adapter。
+  src/tr_asbs/process/references.py
+    ZeroDriftReference、scalar LinearGaussianReference、VPReference、bridge/score。
+  src/tr_asbs/process/kernels.py
+    pure Gaussian kernel、log_prob、sampling、conditional KL、dtype/shape checks。
+  src/tr_asbs/process/matching.py
+    terminal/adjoint target の単位換算、legacy/general mode、weighting policy。
+
+変更:
+  src/tr_asbs/process/sde.py
+    旧 public classes / Hydra paths / state_dict を保持し reference adapter を接続。
+  src/tr_asbs/process/integrator.py
+    共通 kernel と directional API、legacy solver、DiffusionTimeEuler、OU solver、grid。
+  src/tr_asbs/experiment/train_gamma_asbs_iw.py
+    CE/BC、log_variance、buffer、dual 入力、evaluation、metadata と support guards。
+  src/tr_asbs/process/terminal_cost.py
+    score 単位と init/clipping の仕様を保ち、一般 target の組立てを分離。
+  src/tr_asbs/experiment/train_general_asbs_iw.py
+    consistency loss の kernel 移行、または新 solver/reference の明示的 guard。
+  src/tr_asbs/experiment/train_gamma_asbs_iw_ala2.py
+    atomic override の legacy regression と support guards。新 OU 対応は後続。
+  src/tr_asbs/model/mlp.py / src/tr_asbs/variational/control.py
+    conditioning adapter。shared PIS/DIS backbone の既定値を変えない。
+  src/tr_asbs/utils/gaussian_utils.py / src/tr_asbs/utils/eval_logweight.py
+    共通 density と raw ESS、KL・normalization のログを整理。
+  src/tr_asbs/config/train.yaml / src/tr_asbs/config/experiment/
+    新 mode の opt-in 設定。旧 experiment YAML を一括置換しない。
+  tests/
+    既存回帰に加えて下記の必要な contract tests。
+
+cfg.base_sde と cfg.integrator の入口を維持し、新 abstraction を内側に導入する。
+新しい default solver の採用は比較結果の後に別変更で行う。
+非 IW の別 trainer は旧 public API を通じて regression を確認し、自動で新 loss にしない。
+
+============================================================
+10. 必要な検証と完了判定
+============================================================
+
+Stage 0:
+  fixed noise による VE/EDM/cosine の両方向・ratio・loss の互換。
+  fixed log-weight 入力の gamma/V0。gamma floor、IW clipping、anchor flags を含む。
+  Hydra compose、legacy checkpoint、dtype/device、grid endpoints/step count。
+
+Stage 1:
+  V の解析積分・微分、inverse round trip、matched total variance。
+  cosine knot 境界・跨ぐ interval・reverse coefficient のテスト。
+  各 solver の Gaussian sample moments / log_prob。plain Euler の固有 covariance。
+  bridge mean/cov、conditional score、端点 jitter の legacy と新 API の差。
+  FC log_variance の gradient と、直接 Gaussian log_prob 比との一致。
+  self=other の log_Pu_Pref=0 と、self!=other の手計算 path ratio。
+
+Stage 2:
+  OU forward moments、uncontrolled stationarity、true reverse Gaussian conditioning。
+  controlled p/q それぞれの moments、normalization と手計算 path weight。
+  A -> 0 / G fixed の両方向 limit、small beta、短い interval の安定性。
+
+Stage 3:
+  gamma=1 の analytic adjoint と score/Girsanov 単位の一致。
+  legacy target と general TR target の別検証、gamma=0/1/intermediate の oracle。
+  FC/BC/dual の最小 smoke、snapshot/buffer 識別、resume の成功・不一致拒否。
+  未対応 combination の明示的エラー。atomic legacy の回帰。
+
+Stage 4:
+  deterministic predictor からの mean/cov と sample/log_prob の一致。
+  linear controlled oracle、刻み感度、gradient と evaluation count。
+
+解析比較を主とし、Monte Carlo unit test は小 batch と統計誤差に基づく tolerance を使う。
+大規模品質評価を local unit test に混ぜない。未検証の Stage は not_evaluated と記録する。
+
+============================================================
+11. 修正版実験計画（未投入）
+============================================================
+
+A. Solver / grid を分離
+  A1: 同じ frozen network、同じ geometric reference、同じ uniform_t grid で
+      corrected plain Euler / legacy exact-noise Euler / DiffusionTimeEuler を比較。
+  A2: 同じ DiffusionTimeEuler で uniform_t / uniform_tau を比較。
+  最初は rollout-only。学習比較は別に同じ初期重み・loss semantics・予算で行う。
+  fixed noise の互換診断は品質改善の証拠とはしない。
+
+B. Zero-drift schedule
+  同じ solver/grid、prior、target、model、time conditioning、FC/BC weight を固定。
+  geometric / EDM / discrete PIS cosine / constant / linear を必要な範囲で比較。
+  V(1) を揃える倍率 sqrt[V_ref(1)/V_candidate(1)] と実際の g(t) を記録。
+  sigma_max という設定値の一致だけでは matched variance としない。
+  grid/embedding/weighting の同時変更を避け、それぞれを後の ablation にする。
+
+C. OU reference
+  Stage 3 完了後のみ。Brownian と OU に同じ general TR semantics を使う。
+  source.scale、target、モデル・score hint、予算、clipping、epsilon を一致させる。
+  unit VP 対 scaled OU、terminal reference covariance の差も明記する。
+  「best zero drift」は新しい比較の結果から選ぶ。既存 tuning の結論を仮定しない。
+
+D. OU solver
+  exponential Euler / deterministic exponential midpoint の step 数感度。
+  同じ reference 関数を固定し、network calls と energy/score calls を記録。
+  rollout-only と retraining の結果を分ける。
+
+E. Reference x epsilon
+  C/D の validation 後の任意段階。新 reference と epsilon sweep を同時に先行させない。
+  harmonic/preconditioned OU は専用 support の完成後に追加する。
+
+共通 metrics:
+  existing SD / TVD-soft / W2 / sliced W2 / mode coverage（target が提供するもの）。
+  raw_path_ess、tempered/clipped ESS、raw log-weight variance、gamma、lambda、V0、r。
+  achieved forward path KL は new policy からの sample と、new/old の各 kernel の
+  log_prob 差または条件付き Gaussian KL を用いる。normalized RN mean や
+  corrector raw MSE proxy をそのまま achieved KL と呼ばない。
+  fixed source なので initial distribution の KL は0。方向と Monte Carlo 誤差を記録する。
+  wall time、outer iterations、controller/score/energy calls、最初の nonfinite 箇所。
+  failed / numerical_failure / not_evaluated を残し、job 完了を品質合格と同一視しない。
+
+============================================================
+12. 実行時の repository / remote 制約
+============================================================
+
+今回の成果は計画のみ。将来、実装または実験を開始する時点で適用する:
+  ・local は unit test、syntax check、ごく小さい smoke のみ。
+  ・高コスト実験・学習は既存 remote submission を使用する。
+  ・job 投下前にユーザーへ z3 / raiden の選択を確認する。
+  ・job ID、output directory、log path、resolved config、commit を manifest に保存する。
+  ・main session で長時間待たず、短い heartbeat prompt で monitor を設定する。
+    最初10分間隔、2回連続 pending/running なら30分間隔へ変更する。
+    completion / failure / 必要な対応時に報告し、状態不変時は静かにする。
+  ・failure は log から原因を報告する。単純な実装バグなら修正後の軽量確認を経て再投入。
+  ・worktree は5未満。新規作成前に未コミット変更を review し、commit か別 worktree か確認。
+  ・共有 experiment board がある場合は書込み前に最新変更を取り込む。
+    今回の checkout では board に相当するファイルを発見していないため更新していない。
+
+============================================================
+13. 今回実施した軽量検証
+============================================================
+
+既存 test:
+  .venv/bin/python -m pytest -q tests/test_triw_pis_cosine_sde.py
+    4 passed（4.13s）。tracked。
+  .venv/bin/python -m pytest -q tests/test_triw_score_conditioned_control.py
+    5 passed（1.22s）。調査開始時点では untracked のローカル test。
+
+現行コードの1-step 診断（学習なし）:
+  VESDE sigma_min=0.1、sigma_max=2.0、t0=0、t1=0.25、constant network_control=0.3。
+  legacy mean increment:          1.7974393641323947
+  DiffusionTimeEuler の式:        0.9316718427000252
+  exact interval variance:       3.1055728090000843
+  plain Euler sampling variance: 5.991464547107982
+
+mean の違いは noise-free mean の照合で確認した。
+plain Euler の分散は g(t0)^2 Delta t、現行共通 IW は Delta V という差も確認した。
+flat EulerMaruyamaIntegrator の初期化は次で失敗する:
+  Can't instantiate abstract class EulerMaruyamaIntegrator with abstract method step_backward
+
+これらは現行実装と原案の差分の証拠であり、新 solver/OU の品質検証ではない。
+この節の確認時点では新API等は未実装だった。以下が実装後の更新記録である。
+
+============================================================
+14. 実装後の更新記録（2026-10-07）
+============================================================
+
+実装済み:
+  process/noise_schedule.py: scalar noise API、V、inverse、normalization、既存schedule adapter。
+  process/reference.py: BrownianReference、scalar OU/VP、Phi/K/Q、bridge/score、adjoint、
+                        true uncontrolled reverse conditional（learned q_hと区別）。
+  process/transition.py: differentiable Gaussian kernel、sampling/log_prob/entropy/KL、
+                         COM subspaceの有効次元とgraph batchへの対応。
+  process/integrator.py: legacy paths保持、Euler backward、diffusion-time Euler、
+                        linear exponential、midpoint、uniform_t/uniform_tau。
+  experiment/reference_config.py: Hydra presetでconfig全体を置換し、VE固有引数の混入を防止。
+  GammaASBSModule: native kernel logvar、discrete path KL、BC weight、time conditioning、
+                   raw/achieved KL、metadata、凍結snapshotとphaseの再開。
+  ALDP: bounded frame loading、native60/Cartesian66、単一IC chartと追加Jacobian、
+        torsionのperiodic距離、native/physical energy指標、OpenMM費用カウンタ。
+
+第7節の一般TR FCに対する実装上の選択:
+  gamma KL(P_new||P_h)+(1-gamma)KL(P_new||P_old)を有限Gaussian kernel上で直接最小化。
+  gamma=0のvalue/gradient、0<gamma<1のGaussian oracle gradientをunit testで検証した。
+  旧CEをOUの任意gammaへ拡張する実装は採用せず、fixed gamma=1だけを許可。
+  continuous-timeのgeneral adjoint導出は未実装であり、finite-kernel lossと区別する。
+  detached score hintはpath KLに入れない。logvarでは使用可能。
+  midpointのweak order向上、品質改善、速度改善は未評価。
+
+ALDPの追加修正の理由:
+  旧zのdihedralを一周ずらした時、Cartesian座標とenergyの差がsmokeで0だった。
+  そのままR^60の密度と呼ぶと周期の重複が残るため、新設定はy in R^60から
+  bond>0、angle in (0,pi)、dihedralの単一intervalへ滑らかに写す。
+  既存FAB Jacobianにchart Jacobianを加え、Gaussian path kernelはy上で評価する。
+  60->66->60の往復、追加Jacobian、gradientを検証。分布品質は未評価。
+  新設定: src/tr_asbs/config/experiment/ad_ic_reference.yaml。
+
+2026-10-07 密度定義の追加修正:
+  既存regularize_energyはlog density内のU自体を有限値に打ち切る。
+  bond>0のchartは上限なしで、Cartesian IC Jacobianはb^2を含むため、
+  この打ち切りtargetは正規化できない。旧結果は既存実装の診断として保存する。
+  energy_mode=physicalを追加し、raw OpenMM U/(R*T)とforceをそのまま使う。
+  学習用gradient norm clipは別設定として維持する。旧defaultとsnapshotは保持。
+  bank/checkpointにenergy_definitionを保存し、異なる定義の再利用を拒否する。
+  凍結済みの同一A/B座標でphysical energyを再計算し、新snapshotのz3 preflightで
+  実force/有限差分、非打ち切りtail、共有FC/BC/dual/eval/checkpointを確認する。
+  旧targetのgeometry passで後段へ進めない。詳細は最新ALDP段階計画を参照。
+
+検証:
+  tests: 78 passed, 1 skipped（CPU。GPU検証・本学習は行っていない）。
+  主pipeline: 7 Targets x 5 cases = 35/35 passed。
+  各caseは4 samples、4 intervals、1 FC、1 BC、dual/eval/checkpointを含むsmoke。
+  Gaussian/GMM/ring/many-well/DW4/LJ13/ALDP ICで既存CE・新logvar・path KL・OU・VPを確認。
+  ALDP最大往復誤差は約1.15e-5。OpenMM energy/gradientも実際に評価した。
+  DW4/LJ13のreference dataset欠如と全ケースのquality not_evaluatedを保持する。
+  追加5機能（Euler/tau cosine/EDM/midpoint/both embedding）もGMMで確認。
+  生の結果・config: reports/tr_sbs_pipeline_smoke/report.json、各case/resolved_config.yaml。
+  初期のsmoke harness失敗とVP covariance checkの修正前行はprevious reportに保存。
+
+互換性と残る範囲:
+  legacy mean/varianceと公開Hydra class名を保持。不要なnoise drawを除き、同一seedの
+  bitwise pathは変わる。旧checkpointは明示的なlegacy opt-inに限定する。
+  GeneralASBS consistency/graph atomic新reference学習、nonlinear/full covariance、
+  wrapped OU、continuous cosineは未対応。新設定をこれらのtrainerへ渡すと拒否する。
+  checkpointの旧policy/phaseは保持し、bufferは再生成する。bitwise resumeは保証しない。
+  品質/収束/reference admission/速度は今後の評価対象であり、smokeのpassに含めない。
+
+以後の実験計画はdocs/tr_sbs_ablation_and_tuning_policy.txtを使用する。
+solver -> noise shape -> reference -> conditioning/lossの順に絞り込む。
+新設定のtuningは少数候補+successive halvingで行い、ALDPはOpenMM configuration費用も揃える。
+今回の実行指示に従い、job投入・remote実行・scheduled monitoringは一切行っていない。

@@ -303,6 +303,8 @@ class TRIWScoreConditionedControl(nn.Module):
         inner_clip: float = 1e2,
         weight_init: float = 1e-8,
         bias_init: float = 1.0,
+        embedding_time: str = "physical",
+        hint_progress: str = "physical",
     ) -> None:
         super().__init__()
         if num_steps <= 0:
@@ -319,6 +321,14 @@ class TRIWScoreConditionedControl(nn.Module):
             bias_init=bias_init,
         )
         self._potential = None
+        if embedding_time not in ("physical", "variance") or hint_progress not in ("physical", "variance"):
+            raise ValueError("embedding_time and hint_progress must be physical or variance")
+        self.embedding_time, self.hint_progress = embedding_time, hint_progress
+        self._time_reference = None
+
+    def set_reference(self, reference):
+        if self.embedding_time != "physical" or self.hint_progress != "physical":
+            self._time_reference = reference
 
     def set_potential(self, potential: object) -> None:
         """Attach the experiment target used to compute the detached score."""
@@ -362,8 +372,15 @@ class TRIWScoreConditionedControl(nn.Module):
                 "potential.score(x) must have the same shape as x, "
                 f"got {tuple(target_score.shape)} and {tuple(x.shape)}"
             )
-        score_hint = (progress * target_score).detach()
-        raw_step = self.num_steps * (1.0 - progress)
+        tau = progress
+        if self.embedding_time == "variance" or self.hint_progress == "variance":
+            if self._time_reference is None:
+                raise RuntimeError("Variance conditioning requires set_reference()")
+            tau = self._time_reference.reparametrize_time(progress).to(progress)
+        hint_time = tau if self.hint_progress == "variance" else progress
+        embed_time = tau if self.embedding_time == "variance" else progress
+        score_hint = (hint_time * target_score).detach()
+        raw_step = self.num_steps * (1.0 - embed_time)
         return raw_step, score_hint
 
     def forward(

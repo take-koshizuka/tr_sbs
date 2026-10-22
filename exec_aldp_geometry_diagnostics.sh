@@ -1,0 +1,8 @@
+#!/bin/bash
+set -euo pipefail
+PROJECT_PYTHON="${1:?python}"; FROZEN_REPO="${2:?repo}"; CAMPAIGN_ROOT="${3:?campaign}"
+DIAGNOSTIC_SCRIPT="${4:?diagnostic script}"
+export PYTHONPATH="${FROZEN_REPO}/src${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONUNBUFFERED=1 MPLBACKEND=Agg OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1
+hostname
+"${PROJECT_PYTHON}" -u "${DIAGNOSTIC_SCRIPT}" --repo "${FROZEN_REPO}" --campaign "${CAMPAIGN_ROOT}"

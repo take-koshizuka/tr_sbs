@@ -1,0 +1,288 @@
+Latest final state 2026-10-08T03:09:04.911128+00:00: all requested FC/BC/dual・solver/noise/reference
+comparisons and reports complete (10 scientific cells:8completed,2failed).
+Quality unachieved/geometry not_admitted;no new runs or final test opened.
+Report:reports/aldp_chart_20261007_5a093a95/component_summary_20261008T0304.md.
+
+ALDP staged component comparison, preregistered before stability-result selection
+
+Full objective: FC/BC/dual stability -> loss compatibility bridge -> solver ->
+noise -> reference. Current geometry remains not_admitted. Later comparisons
+are diagnostic until the original quality/cut/seed confirmation gates pass.
+Do not stop the objective at an execution preflight or a failed quality screen.
+All molecular training and evaluations run on z3; local work is bounded testing
+and artifact analysis. Existing results and all failed/not_evaluated rows remain.
+
+Current stability controls and selection
+   Wait for terminal accounting/log/all-artifact SHA/input verification of all
+   four new stability pilots. Include cached5174139 as the baseline control;
+   other old cuts/source widths/20-loop curves are disclosed,not selected into
+   this10-loop low_density/width1/clip1000 comparison. No old condition rerun.
+   Validate equal target/source/chart/model capacity/time-coordinate metadata.
+   A selects; B discloses; test.h5 remains closed. Frozen A thresholds:
+      phi/psi TVD0.768310546875,JS0.05,raw physical energy W2 8kT,
+      coarse basin TVD0.15,missing mass0.10.
+   If any seed0 cell passes every A pilot threshold,choose minimum training/
+   online OpenMM cost,then balanced A rank. This is pilot evidence,not geometry
+   admission or a hardware speed ranking. If no cell passes,choose only a
+   diagnostic setting: most passed A thresholds,then equal mean ranks over the
+   five A metrics,below-MD-distance-q01 fraction and descending raw-path ESS,
+   then training/online cost. Ties use the stable candidate name. B cannot enter
+   selection. Selection stays pending while any required cell lacks verified
+   completion or a verified terminal failure. Preserve failure status/log cause.
+   Never choose from energy alone or silently combine the four factors.
+
+   After each u/h phase128 raw samples provide small diagnostics,not admission.
+   BC holds forward-u parameters fixed: compare paired u/h Cartesian array SHA
+   and reverse path RN variance/ESS. BC's influence on the next FC update is
+   indirect through the reverse path measure/dual update. Record gamma at FC
+   completion and the subsequent group-bootstrap dual estimates separately.
+   Initial/final1024 and phase128 use different draws;no paired trajectory claim
+   across those sample sizes. Bootstrap32 groups estimates finite-bank sensitivity,
+   not convergence/unbiasedness. Same-seed different hardware can differ.
+
+Shared training/evaluation contract
+   Freeze the selected stability setting without combining factors: source
+   width1,low_density chart,physical uncapped density,terminal clip1000,10 outer
+   loops,regularu40/h40 updates per outer,initial-u duration,dual groups/paths,
+   BC weighting,capacity,optimizers,model physical-time embedding and N200 grid.
+   All new runs are fresh same-seed diagnoses; checkpoints omit RNG/buffers.
+   Exactly one new common-loss bridge changes CE to log_variance on the cached
+   legacy VE/solver. FC uses exact configured finite-kernel densities and full
+   dense stored trajectories. Full BC uses the analytic reference bridge
+   conditioned on its two endpoints. Euler finite kernels approximate that
+   continuous reference; do not claim their covariance is identical.
+   Log-variance makes no terminal-force call in its FC loss. The configured
+   terminal clip remains a recorded diagnostic threshold; it does not clip
+   that loss's terminal force. Per-time CE anchor is inactive in log_variance.
+   Record these method differences in the bridge rather than attribute them to
+   solver/reference. Retain the selected flags in subsequent configurations.
+   Gamma trust-region schedule stays active,epsilon1,gamma_floor0,no rollback.
+   Corrector gamma remains none; Gaussian kernels remain in unconstrained y.
+   No chart wrapping/clamping,raw-sample filtering or final-test tuning.
+
+Minimum staged comparisons
+   1) loss_bridge:1 new log_variance/legacy/geometric pilot versus the cached
+      selected CE cell. Full budget held,actual compute and OpenMM cost disclosed.
+   2) solver:cached bridge legacy versus2 new Euler/diffusion-time Euler pilots,
+      same VE geometric noise,total continuous integrated diffusion0.249999,
+      physical grid uniform_t,N200,common loss/training frozen. Only integrator
+      class changes. Each uses its own finite Gaussian density/RN convention.
+      Report continuous V separately from summed/composed finite variances.
+   3) noise:reuse chosen solver's geometric cell;2 new constant/cosine pilots,
+      same solver,N200,physical grid,continuous integrated diffusion0.249999.
+      Cosine noise knots200 remain fixed even for N4 solver preflight;changing
+      the noise schedule does not change the solver's number of intervals.
+      Geometric keeps the existing VE implementation and exact coefficients.
+   4) reference:reuse the constant-Brownian cell from the noise screen and1 new
+      scalar OU pilot,rate1,diffusion^2=0.249999. Use one exact linear solver
+      with left score-unit control;rate0 is the Brownian control representation.
+      The constant Brownian finite kernels of all three zero-drift solvers
+      equal the rate0 exact linear kernels within rounding. Test conditional
+      BC bridge/scores too. Do not silently count representation changes as
+      empirical improvements or claim bit-identical hardware trajectories.
+      Run a zero-path/zero-OpenMM equivalence audit before reusing that control.
+      For OU disclose Phi,K,Q in both directions and composed finite covariance:
+      equal integrated diffusion does not mean equal endpoint covariance.
+      Source is mapped nonGaussian:terminal marginal covariance additionally
+      propagates source covariance;conditional Q alone is not that marginal.
+      VP is excluded;its stationary-Gaussian-source contract is not satisfied.
+   At most6 new full pilots after stability,plus preflight only for genuinely
+   new configurations. Reuse cached pilot controls without resubmitting them.
+   Each stage retains its own result root,plan,ledger,receipts and source SHA.
+   A-only balanced selection between eligible solver/noise cells uses the same
+   rule above; no extra seeds or grid search are silently added.
+
+Verification and costs
+   Every new configuration first passes shared-pipeline B4/N4 FC/BC/dual smoke
+   and exact stage contract checks. Require root/batch/extern COMPLETED/0:0,
+   postflight marker,all receipt files/source/plan/data/bank/audit/cached SHA,
+   paired physical-source agreement,RNG isolation,phase order/step count,
+   positive finite kernel covariances and exact counted OpenMM boundaries.
+   A green smoke is execution evidence only. Receipt every diagnostic array.
+   Finite-kernel metadata records actual timesteps,Phi/K/Q,continuous V and
+   composed forward/reverse reference covariance without drawing extra paths.
+   Keep phase128 and final1024 diagnostic/reporting samples fixed across cells.
+
+   Log-variance FC buffers use2B OpenMM configurations per FC epoch,CE6B.
+   Dual work and online/final/diagnostic costs keep their original boundaries.
+   With initial-u40 and dual32x8:29504 training/online+2048 final+11136 diagnosis
+   =42688 per new pilot;cap is declared and checked. If initial-u1000 is selected:
+   92480+2048+11136=105664. If dual128x8 is selected:37184+2048+11136=50368.
+   Ordinary B4/N4 smoke costs24+8+48=80;longer initial-u or larger dual smoke92.
+   These exact expected counts must agree with actual counters before admission.
+   Report optimizer u/h counts,OpenMM calls,total costs,wall seconds and device;
+   dense log-variance network cost differs from CE,so OpenMM alone is not speed.
+
+Execution/monitoring
+   Use immutable component_prepared_v3/code (raw inverse-diagnostic reporting
+   fix after pilot5176940) built from verified v2 archive plus seven explicit
+   runner/analysis/test overlays. All src files,strict inverse,scientific settings
+   and kernels are unchanged;retain both failures and immutable parents.
+   Raw arrays are saved before inverse diagnostics;full inverse failures are
+   reported and cannot pass geometry,without filtering or changing samples.
+   Smoke must still pass the strict roundtrip check. Freeze flags in stage plans
+   only after audited stability results. Never modify current running snapshots.
+   Executor exec_aldp_component_campaign.sh reuses the shared trainer/Slurm API.
+   monitor_aldp_mechanism_campaign.py verifies component contracts when the plan
+   includes component_diagnostics and stability_diagnostics. Loss-aware cost
+   verification remains backwards-compatible with historical CE receipts.
+   Record all IDs/output/log/configs. One scheduled monitor per run,10 minutes,
+   30 after two pending/running checks,new dispatch resets. No interactive job
+   waiting,local molecular work or duplicate dispatch. Diagnose failure logs;
+   tested simple bugs alone may use a new snapshot/output for automatic retry,
+   retaining all old results. End only after all requested comparisons and their
+   scientific reports are verified. Geometry/reference convergence is distinct.
+
+2026-10-07 observer-bug retry record
+   First loss-bridge preflight5176771 FAILED/1:0 before optimizer updates:
+   ComponentObserver used module.corrector_matching_mode,which does not exist;
+   GammaASBSModule stores that mode in module.cfg. One-line lookup correction
+   plus6 real-module startup regressions;63 focused tests passed,1 old warning.
+   New immutable343-file source51e2a739744ff6c9f4cc84310697cf8678890bf22badf972d4d98c048b92c55f,
+   archiveb98d6a9846335279a14c25da5f2a2958361a1a8dd1d8e5618134fccd958e6ff2.
+   Retry physical_loss_bridge_v2 preflight5176873 submitted on z3 at22:38Z,
+   plan698e72bd8ae5faf31a204f366151c11231533bdcc0769d596287d4e4cf8ae99d,
+   cached335 files include preserved failed artifacts. No quality result or
+   full pilot yet. Scientific configurations/kernels/costs are unchanged.
+   Continue loss bridge ->solver ->noise ->reference after execution gates;
+   no old-control resubmission,no additional tuning or changed admission gates.
+
+2026-10-07 final-inverse diagnostic retry record
+   Pilot5176940 FAILED1:0(root/batch),extern0:0,in7m44s on A40. Final checkpoint
+   verifies800 updates/epoch400/outer10/ready;strict final inverse rejected a
+   dihedral before raw final arrays/result/receipt save. Final quality and exact
+   failed OpenMM totals unavailable.80 recovered files/four remote checkpoints
+   SHA verified,all old outputs retained. Raw boundary fraction not measured.
+   The diagnostic repair retains raw outputs/rejection and forward-chart boundary
+   counts without changing samples or strict chart.75 focused tests pass;existing
+   stability selection stays time_anchor and all quality-failed rows remain.
+   New immutable343-file source6e08fc08.../archive6d1f18a7... uses seven explicit
+   overlays on verified v2 archive;all src files/config/kernel coefficients match.
+   physical_loss_bridge_v3 preflight5177022 submitted23:08Z,plan60217c5a...,
+   cached419 incl failure provenance.80 OpenMM smoke/42688 full cap60000 unchanged;
+   failed7m44s/800 updates are additional overhead. Full preflight audit first,
+   then same-seed fresh logvar bridge;no checkpoint/observer-report fabrication.
+   Continue full common-loss->solver2->noise2->OU1 objective with controls reused,
+   A only selection/B disclosure/test closed,geometry_not_admitted.
+
+2026-10-07T23:46Z current component-stage pointer
+   CE/LV bridge5177052 COMPLETED0:0 with all61fullreceipt SHA and scientific
+   report verified. Severe LV quality failure1022/1024 dihedral boundaries;
+   loss_bridge_v3 now frozen and reused as legacy solver control,never rerun.
+   Current physical_solver_v1 preflight5177148,plan3c57e113...,cached520,
+   unchanged component_prepared_v3 source343/6e08fc08.... Exactly two new
+   Euler/diffusion_euler seed0 cells,only integrator class differs. Full pilots
+   remain not_submitted pending all preflight gates. Expected160 smoke total,
+   42688 per full/cap60000. Bounded scheduled audit at10min/reset0;30 after2active.
+   Continue A-only solver->noise->reference diagnosis on fixed LV training,
+   B disclosure/test closed/geometry_not_admitted,no tuning or added grids/seeds.
+
+2026-10-08T00:32Z current stage pointer
+   Solver preflight5177148 verified;new Euler5177178 completed/all61 receipt SHA/
+   all66 retrieved SHA,quality failed and strict inverse rejected raw369/1024.
+   Diffusion_euler5177180 RUNNING in the same audit;cached legacy5177052 fixed.
+   All-three selection guard rejects partial results;no solver choice yet.
+   Native30min after2active snapshots,new dispatch10min/reset0. Continue fixed
+   LV/source/chart/training solver->noise2->OU1 diagnosis with original A rule,
+   B disclosure/test closed/geometry_not_admitted. No extra jobs or local MD.
+
+2026-10-08T01:56Z current noise-stage pointer (supersedes pending solver notes)
+   Solver all3 outcomes audited:Euler5177178 complete/all61receipt SHA and
+   quality failed;Diff5177180 FAILED1:0 after798/800 successful updates,nonfinite
+   loss/gradient rejection at epochs218/219. Old outputs/60recovered SHA/2remote
+   checkpoints retained,no runtime bug identified/no retry;final quality and
+   exact failed OpenMM unavailable. Frozen A balanced rule selects Euler only
+   diagnostically;both successful solvers miss all5numeric gates/inverse.
+   Complete solver report/figures/failure context verified;geometry未採用。
+   physical_noise_v1 reuses unchangedsource343/6e08fc08...,plan9932fdaa...,
+   cached704;closed solver results frozen/no further parent monitor. Geometric
+   Euler5177178 reused. Only base_sde changes;constant/cosine,knots200,N200,
+   continuousV0.249999 and full LV/source/chart/training/dual held.
+   Preflight5177304 COMPLETED0:0 in42s;all33receipt SHA/4remote checkpoints/
+   source/input/cache/phase/RNG/cost/kernel/strict inverse pass,80OpenMM each.
+   Exactly constant5177377/cosine5177378 submitted01:56Z;PENDING in that audit.
+   Full declarations800 updates/42688OpenMM each/cap60000,quality未評価。
+   Native heartbeat points to noise/full IDs,10min/reset0;2active->30min.
+   All3noise outcomes before A-only comparison/B disclosure/testclosed,then
+   actualconstant Brownian-rate0 conditionalkernel/BC equivalence->OUrate1 only.
+   No old reruns/local heavy/job waits/extra seeds/tuning;fullgoal active.
+   reports/aldp_chart_20261007_5a093a95/physical_noise_v1/README.md.
+
+2026-10-08T02:06Z noise reporter/preflight recovery
+   All40 preflight recovered-file SHA pass(33receipt SHA/4remote checkpoints).
+   summarize_noise.py(3cb8ac15...) ready;7actual-evidence guards0.135s and
+   actual z3 closed-control/layout/pending-audit guard pass,0newpaths/OpenMM/
+   updates/scheduler polls. Report not yet produced;all3terminal audited
+   outcomes required. After recovery,run p m/analysis_code/summarize_noise.py
+   --campaign m/results --audit m/verification_<latest>.json --repo fixedcode
+   --output-prefix m/noise_complete_<freshstamp>. The unchanged frozen A rule
+   selects only diagnostically,Bdisclosed/testclosed;reuse geometric5177178.
+   Then actualconstant Brownian-rate0 kernel/conditionalBC equivalence->OU1.
+   Never rerun cached controls or remonitor frozen solver parent;goal active.
+
+2026-10-08T02:30Z current reference-stage pointer (supersedes noise monitoring)
+   All3noise outcomes audited:cosine5177378 COMPLETED/all61receipt+66retrieved
+   SHA/800updates/42688OpenMM;constant5177377 FAILED1:0/797updates/FCreject3,
+   all60retrieved/2remoteCP SHA,finalquality/cost unavailable. No simple bug/no
+   retry. Frozen A rule chooses cosine diagnostically,2/5numeric gates/inverse
+   pass but JS/energy/basin fail;geometry未採用。Fullnoise report/figures backed.
+   Closed noise/solver results frozen,no parent monitoring/resubmission.
+   physical_reference_v1,source343/6e08fc08... unchanged,plan4a45b814...,
+   cached886/driver3bbd6413.... Only1OUrate1 new condition,exactlinear/leftscore/
+   constantdiffusion²0.249999,N200;allsource/chart/training/LV/BC/dual fixed.
+   Actualfailed constant5177377 stays Brownian control despite cosine selection.
+   Six actualevidence guards0.353s and actualconfig/checkpoint/kernel/conditional
+   BC/bridge rate0 equivalence pass,N4/N200,maxerror3.32e-9,0paths/OpenMM/RNG
+   unchanged. Failed control797/800,finalquality/cost not_evaluated;no imputation.
+   OU forwardPhi/K/Q0.367879/0.158030/0.108083,reverse2.718282/0.429569/0.798629;
+   source covariance additional,no stationaryGaussian/VP claim.
+   Preflight5184071 submitted02:30:35Z;no postsubmission accounting observed.
+   B4/N4/80OpenMM expected;only allstep/log/receipt/source/input/cache/phase/RNG/
+   cost/kernel/strictinverse pass unlocks1OU seed0/800updates/42688/cap60000.
+   Native reference heartbeat10min/reset0,2active->30min,newdispatch10min.
+   Need actualfullreference outcome/report plus finalcrossstage synthesis;
+   fullgoal active/no localheavy/waiting/duplicate/extra seeds/tuning/test access.
+   reports/aldp_chart_20261007_5a093a95/physical_reference_v1/README.md.
+
+
+## 2026-10-08T02:48Z — OU preflight verified; full pilot dispatched
+
+Preflight **5184071** COMPLETED/0:0 for root/batch/extern,26s,htc-gpu029.
+All source343/cached886/input/receipt/phase/RNG/cost/kernel/strict-inverse gates
+passed. The audited driver dispatched exactly one full **OU5184113**, seed0,
+u400+h400/800 updates,N200. At the 02:48:11Z snapshot it was PENDING.
+Full quality and measured cost remain not_evaluated;42688 OpenMM is declared
+until actual receipt counters are available. Geometry_not_admitted.
+Output: /scratch/htc/tkoshizuka/aldp_chart_20261007_5a093a95/physical_reference_v1/results/mechanism_pilot/ou_seed0.
+Log: /scratch/htc/tkoshizuka/aldp_chart_20261007_5a093a95/physical_reference_v1/results/logs/aldp-mech-ou-5184113.out.
+No parent reruns or changes to physical/source/chart/LV/training/dual.
+Native heartbeat10min/reset0;next check >=02:58:11Z.
+
+
+## 2026-10-08T03:09:04.911128+00:00 — all component comparisons closed; final report
+
+OU **5184113** COMPLETED/0:0 root/batch/extern,7m16,htc-gpu029;the02:58:54Z
+audit verifies source343/cached886/input/plan4a45/log/all61full receipt SHA.
+All66download SHA and2remote checkpoint SHA verified;pref5184071 all17receipt
+SHA/24download SHA/2remote checkpoints retained. Actual800u+h updates,
+42688OpenMM=29504training-online+2048final+11136diagnosis,529batchcalls.
+A JS0.192075,energyRMS172.896kT,basinTVD0.308594,missing0.098633,
+close0.0908203,rawESS0.00126894,strictinverse2.235e-7nm/no boundaries.
+2/5numeric gates pass;JS/energy/basin fail. Geometry_not_admitted.
+OU dual independent gamma error1.491e-10,KLmax3.248/>1 10/21,bootstrap width0.466.
+Failed actual Brownian5177377 remains797/800/3FCrejects/no final quality or
+exact cost;no paired reference-quality superiority claim or rerun.
+
+All planned scientific comparison cells closed:stability4+component6=10,
+8completed/2numerical failures;controls reused. Diagnostic loss-bridge
+implementation failures5176771(27s)/5176940(464s) remain separately retained,
+with unavailable exact failed OpenMM totals;not counted as scientific cells.
+[Final synthesis](aldp_chart_20261007_5a093a95/component_summary_20261008T0304.md),
+[reference report](aldp_chart_20261007_5a093a95/physical_reference_v1/reference_complete_0258_report.md),
+[final verification](aldp_chart_20261007_5a093a95/component_summary_verification_20261008T0304.json).
+All A-only/Bdisclosure/testclosed boundaries kept. No extra seeds/tuning/runs.
+FC/BC/dual and solver/noise/reference reporting objective achieved;physical
+distribution quality and original geometry confirmation remain unachieved.
+Scheduled monitoring ends after final artifact verification.
+
+Native aldp-tr-sbs PAUSED: all comparison/report artifacts verified;monitoring ended.
